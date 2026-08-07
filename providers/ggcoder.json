@@ -8,7 +8,7 @@
     "type": "command",
     "command": "ggcoder",
     "args": [
-      "acp"
+      "--rpc"
     ]
   },
   "repository": "https://github.com/kenkaiiii/gg-framework",
