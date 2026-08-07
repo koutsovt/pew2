@@ -6,3 +6,21 @@
 # per-run root is what makes them sweepable in a single step.
 [test]
 preload = ["./scripts/test-setup.ts"]
+
+# `bun test packages` recursively walks every directory under `packages` for
+# test discovery — it only skips `node_modules` and hidden (dot) directories
+# by default, so without this it also walks `packages/app/ios/Pods` (thousands
+# of vendored CocoaPods/boost headers) and other native build output on every
+# run. That walk is slow enough to starve the event loop mid-run, which is
+# what produced flaky "ACP connection closed" failures in
+# packages/daemon/src/testing/pipeline.test.ts and a readback race in
+# packages/daemon/src/cli/service.test.ts: spawned child processes' stdio
+# pipes went unserviced while bun was still scanning.
+#
+# Bun prunes matched directories during scanning and never traverses their
+# contents, so this makes discovery both correct and cheap.
+pathIgnorePatterns = [
+  "packages/app/ios/**",
+  "packages/app/android/**",
+  "packages/app/.expo/**",
+]

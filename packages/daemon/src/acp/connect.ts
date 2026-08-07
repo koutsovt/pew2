@@ -563,8 +563,14 @@ export async function connectProvider(options: ConnectOptions): Promise<AcpSessi
   // its death to the session currently living on it, not the first one.
   let exitHandler = options.onExit;
   let exited = false;
+  // Captured for `failureContext()` below: without this, "ACP connection
+  // closed" cannot tell a process that crashed (exit code, or a signal that
+  // killed it) from one that is merely still starting when the handshake
+  // gives up.
+  let lastExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   child.on("exit", (code, signal) => {
     exited = true;
+    lastExit = { code, signal };
     if (pid !== undefined) void unregisterChild(pid);
     exitHandler?.(code, signal);
   });
@@ -701,7 +707,12 @@ export async function connectProvider(options: ConnectOptions): Promise<AcpSessi
   // not say which agent, what was run, or why it died.
   const failureContext = () => {
     const invocation = `It was started with: ${provider.command} ${provider.args.join(" ")}`;
-    return stderrTail.length > 0 ? `${invocation}\n${stderrTail.join("\n")}` : invocation;
+    const exitInfo = lastExit
+      ? ` It exited with code ${lastExit.code ?? "null"}${lastExit.signal ? `, signal ${lastExit.signal}` : ""}.`
+      : "";
+    return stderrTail.length > 0
+      ? `${invocation}${exitInfo}\n${stderrTail.join("\n")}`
+      : `${invocation}${exitInfo}`;
   };
 
   // Bounded, because this await is the one that used to hang forever. Nothing
