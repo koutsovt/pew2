@@ -25,7 +25,7 @@ import {
   restoreMethodFor,
   withTimeout,
 } from "./connect.js";
-import type { LoadedProvider } from "../providers/registry.js";
+import { loadProviders, type LoadedProvider } from "../providers/registry.js";
 
 test("a promise that never settles is rejected with the caller's error", async () => {
   const never = new Promise<string>(() => {});
@@ -95,6 +95,29 @@ test("the timeout marker survives being carried through a rejection", async () =
   // which would report a dead process as merely slow.
   expect("ACP connection closed").not.toContain(HANDSHAKE_TIMEOUT_MARKER);
   expect("'goose' was not found on PATH").not.toContain(HANDSHAKE_TIMEOUT_MARKER);
+});
+
+test("a dead process names its own exit code, not just 'connection closed'", async () => {
+  // The one real spawn in this file, deliberately: `failureContext()`'s
+  // exit-code/signal reporting only exists to answer "did the process crash,
+  // or is something merely hung?", and that is only true of a real child
+  // process's real exit — a fake promise rejection can't stand in for it. A
+  // command that exits immediately with a known code is cheap enough to run
+  // as a unit test rather than push this into the slower pipeline suite.
+  const { providers } = await loadProviders();
+  const echo = providers.find((provider) => provider.manifest.id === "echo");
+  if (!echo) throw new Error("echo provider fixture is missing");
+
+  const brokenProvider = { ...echo, command: "bun", args: ["-e", "process.exit(7)"] };
+
+  await expect(
+    connectProvider({
+      provider: brokenProvider,
+      cwd: process.cwd(),
+      onUpdate: () => {},
+      onPermissionRequest: () => {},
+    }),
+  ).rejects.toThrow("exited with code 7");
 });
 
 test("a conversation already on screen is restored without a second copy of it", () => {
