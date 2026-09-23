@@ -3,9 +3,10 @@
  *
  * `connectProvider` spawns a real process, so most of it is not unit-testable
  * without one. What is tested here is the part that had no bound at all: an
- * agent that never answers `initialize` — plus, with one real spawn at the
- * bottom, the process lifecycle: a child gets its own process group, and
- * closing the session takes that whole group with it.
+ * agent that never answers `initialize` — plus a few real spawns: an agent that
+ * dies or breaks the connection during the handshake, and the process lifecycle
+ * (a child gets its own process group, and closing the session takes that whole
+ * group with it).
  *
  * That case is not hypothetical. A corrupt `npx` cache, an agent that prompts
  * for login on a stdin nobody is reading, or a package that simply does not
@@ -16,7 +17,7 @@
  */
 import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -25,7 +26,7 @@ import {
   restoreMethodFor,
   withTimeout,
 } from "./connect.js";
-import { loadProviders, type LoadedProvider } from "../providers/registry.js";
+import type { LoadedProvider } from "../providers/registry.js";
 
 test("a promise that never settles is rejected with the caller's error", async () => {
   const never = new Promise<string>(() => {});
@@ -98,26 +99,30 @@ test("the timeout marker survives being carried through a rejection", async () =
 });
 
 test("a dead process names its own exit code, not just 'connection closed'", async () => {
-  // The one real spawn in this file, deliberately: `failureContext()`'s
-  // exit-code/signal reporting only exists to answer "did the process crash,
-  // or is something merely hung?", and that is only true of a real child
-  // process's real exit — a fake promise rejection can't stand in for it. A
-  // command that exits immediately with a known code is cheap enough to run
-  // as a unit test rather than push this into the slower pipeline suite.
-  const { providers } = await loadProviders();
-  const echo = providers.find((provider) => provider.manifest.id === "echo");
-  if (!echo) throw new Error("echo provider fixture is missing");
+  // A real spawn, deliberately: `failureContext()`'s exit-code/signal reporting
+  // only exists to answer "did the process crash, or is something merely
+  // hung?", and that is only true of a real child process's real exit — a fake
+  // promise rejection can't stand in for it. A command that exits immediately
+  // with a known code is cheap enough to run as a unit test.
+  //
+  // Redirected because connecting records the child in the daemon's own state
+  // directory, and a test must not write to the one a live daemon is reading.
+  const previousHome = process.env.PEW2_HOME;
+  process.env.PEW2_HOME = mkdtempSync(join(tmpdir(), "pew2-connect-"));
 
-  const brokenProvider = { ...echo, command: "bun", args: ["-e", "process.exit(7)"] };
-
-  await expect(
-    connectProvider({
-      provider: brokenProvider,
-      cwd: process.cwd(),
-      onUpdate: () => {},
-      onPermissionRequest: () => {},
-    }),
-  ).rejects.toThrow("exited with code 7");
+  try {
+    await expect(
+      connectProvider({
+        provider: { ...echoProvider, command: "bun", args: ["-e", "process.exit(7)"] },
+        cwd: tmpdir(),
+        onUpdate: () => {},
+        onPermissionRequest: () => {},
+      }),
+    ).rejects.toThrow("exited with code 7");
+  } finally {
+    if (previousHome === undefined) delete process.env.PEW2_HOME;
+    else process.env.PEW2_HOME = previousHome;
+  }
 });
 
 test("a conversation already on screen is restored without a second copy of it", () => {
@@ -190,6 +195,47 @@ posixTest("a spawned agent is its own process group, and close() ends the group"
 
     handle.close();
     await exited;
+  } finally {
+    if (previousHome === undefined) delete process.env.PEW2_HOME;
+    else process.env.PEW2_HOME = previousHome;
+  }
+});
+
+posixTest("an agent that fails the handshake but stays alive is shut down", async () => {
+  // Closing stdout ends the ACP connection, so the handshake fails at once, yet
+  // the process lives on. Before, only a *timed-out* handshake stopped the
+  // child, so every retry from the phone left one more of these running.
+  const previousHome = process.env.PEW2_HOME;
+  const home = mkdtempSync(join(tmpdir(), "pew2-connect-"));
+  process.env.PEW2_HOME = home;
+  const pidFile = join(home, "agent.pid");
+  // `exec` keeps one pid throughout, so the recorded pid is the one to check.
+  const script = `echo $$ > '${pidFile}'; exec 1>&-; exec sleep 30`;
+
+  try {
+    await expect(
+      connectProvider({
+        provider: { ...echoProvider, command: "sh", args: ["-c", script] },
+        cwd: tmpdir(),
+        onUpdate: () => {},
+        onPermissionRequest: () => {},
+      }),
+    ).rejects.toThrow("failed to start");
+
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    const isAlive = () => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const deadline = Date.now() + 2000;
+    while (isAlive() && Date.now() < deadline) await Bun.sleep(25);
+    const alive = isAlive();
+    if (alive) process.kill(pid, "SIGKILL");
+    expect(alive).toBe(false);
   } finally {
     if (previousHome === undefined) delete process.env.PEW2_HOME;
     else process.env.PEW2_HOME = previousHome;

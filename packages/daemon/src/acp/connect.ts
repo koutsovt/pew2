@@ -746,10 +746,31 @@ export async function connectProvider(options: ConnectOptions): Promise<AcpSessi
   // An agent that dies immediately — bad arguments, missing config — already
   // rejects here promptly, but as a bare "ACP connection closed" that names
   // neither the agent nor the reason it printed on the way out.
-  const initialized = (await handshake.catch((error: unknown) => {
+  const initialized = (await handshake.catch(async (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
     if (message.includes(HANDSHAKE_TIMEOUT_MARKER)) throw error;
-    throw new Error(`'${provider.manifest.name}' failed to start: ${message}. ${failureContext()}`);
+    // The closed pipe routinely beats the `exit` event, so without a short wait
+    // `failureContext()` could not say how the process died. Bounded: a child
+    // that closed its stdout but is still alive delays the error by 250ms at most.
+    if (!exited) {
+      await new Promise<void>((resolve) => {
+        const onExit = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          child.off("exit", onExit);
+          resolve();
+        }, 250);
+        child.once("exit", onExit);
+      });
+    }
+    // Built before `stop()`, so a child still alive here is not reported as
+    // killed by our own SIGTERM. A process that broke the connection but kept
+    // running is useless to us and must not outlive the error, as on timeout.
+    const failure = new Error(`'${provider.manifest.name}' failed to start: ${message}. ${failureContext()}`);
+    stop(0);
+    throw failure;
   })) as {
     agentCapabilities?: {
       loadSession?: boolean;
