@@ -8,7 +8,7 @@
  */
 import { expect, test } from "bun:test";
 import { directionKey, isEnvelope, seal } from "./crypto.js";
-import { ClientMessage, ServerMessage, WIRE_VERSION, wireMismatch } from "./wire.js";
+import { ClientMessage, readCursors, ServerMessage, WIRE_VERSION, wireMismatch } from "./wire.js";
 
 test("an outdated hello still parses, so its sender can be told why", () => {
   // The subtle one. Pinning `wire` to a literal in the schema would make this
@@ -131,6 +131,32 @@ test("every message the app actually sends is accepted", () => {
   }
 });
 
+test("provider.config is one name for two shapes, one per direction", () => {
+  // The app names a single choice; the daemon answers with the whole set a new
+  // conversation will open with — the same split `session.config` already has.
+  // Both halves have to validate in their own direction, or the empty state
+  // either cannot set a model or is never told what the next prompt will use —
+  // and the second of those is a pill naming a model that is not running.
+  const chosen = {
+    t: "provider.config",
+    providerId: "claude-code",
+    configId: "model",
+    value: "opus",
+  };
+  const announced = {
+    t: "provider.config",
+    providerId: "claude-code",
+    configOptions: [{ id: "model", name: "Model", type: "select", currentValue: "opus" }],
+  };
+
+  expect(ClientMessage.safeParse(chosen).success).toBe(true);
+  expect(ServerMessage.safeParse(announced).success).toBe(true);
+  // Neither passes as the other: a daemon that took an announcement for a choice
+  // would write a preference with no value in it.
+  expect(ServerMessage.safeParse(chosen).success).toBe(false);
+  expect(ClientMessage.safeParse(announced).success).toBe(false);
+});
+
 test("a prompt keeps its attachments and defaults them when absent", () => {
   // The one field carrying bytes to disk. If validation dropped or reshaped it,
   // a prompt that says "look at the screenshot" would arrive without one.
@@ -167,4 +193,92 @@ test("a message missing what the daemon will use is refused", () => {
       ok: false,
     });
   }
+});
+
+test("a catch-up carries the approvals the agent is still blocked on", () => {
+  // Zod strips what it does not declare, so this schema is where a field is
+  // silently lost. That matters more here than for most: the app cannot infer
+  // an open request from the replayed events (a logged `permission_request` is
+  // history, and answered long ago in a resumed transcript), so if `params` did
+  // not survive the boundary a reconnecting phone would show the fallback
+  // "Allow/Reject" for a request whose real choices were something else — or,
+  // with the array dropped entirely, no sheet at all and an agent waiting for
+  // ever, since nothing times a permission out at either end.
+  const frame = ServerMessage.parse({
+    t: "session.replay",
+    sessionId: "s1",
+    events: [],
+    complete: true,
+    catchUp: true,
+    working: true,
+    permissions: [{ requestId: "perm_1", params: { toolCall: { title: "Run tests" } } }],
+  });
+  expect(frame).toMatchObject({
+    permissions: [{ requestId: "perm_1", params: { toolCall: { title: "Run tests" } } }],
+  });
+
+  // Optional in both directions that matter: an empty array is the daemon
+  // saying nothing is pending (which is what dismisses a sheet answered at the
+  // desk), and an omitted field is an older daemon that says nothing at all.
+  // The app tells those apart, so both have to reach it intact.
+  expect(
+    ServerMessage.parse({ t: "session.replay", sessionId: "s1", events: [], permissions: [] }),
+  ).toMatchObject({ permissions: [] });
+  expect(
+    (ServerMessage.parse({ t: "session.replay", sessionId: "s1", events: [] }) as {
+      permissions?: unknown;
+    }).permissions,
+    // Undefined rather than absent-as-a-key: what the app branches on is the
+    // value, and asserting the key's absence would test Zod's output style
+    // rather than the distinction this carries.
+  ).toBeUndefined();
+
+  // An entry with no id is unanswerable, and would render a button that posts
+  // `undefined` at the daemon.
+  expect(
+    ServerMessage.safeParse({
+      t: "session.replay",
+      sessionId: "s1",
+      events: [],
+      permissions: [{ params: {} }],
+    }).success,
+  ).toBe(false);
+});
+
+test("a push registration is a client message, and needs a real platform", () => {
+  // Additive rather than a `WIRE_VERSION` bump: an older daemon answers
+  // `unknown_message` and the app keeps its local-only banners, instead of the
+  // connection being refused and working sessions going down over a
+  // notification improvement.
+  expect(
+    ClientMessage.safeParse({
+      t: "app.push",
+      token: "ExponentPushToken[abc123]",
+      platform: "ios",
+    }).success,
+  ).toBe(true);
+
+  // The daemon branches on this to decide whether to name an Android channel,
+  // and naming one the device never created means nothing is shown at all.
+  expect(
+    ClientMessage.safeParse({ t: "app.push", token: "ExponentPushToken[abc]", platform: "web" })
+      .success,
+  ).toBe(false);
+
+  // An empty token would be sent to Expo on every finished turn for nothing.
+  expect(ClientMessage.safeParse({ t: "app.push", token: "", platform: "ios" }).success).toBe(false);
+});
+
+test("cursors off a raw hello are taken only when they are usable seq numbers", () => {
+  // `hello` establishes the connection, so it is read before any schema can be
+  // applied to it — whatever the socket sent is a plain `unknown`. Both
+  // transports answer these cursors with a catch-up replay, and a negative or
+  // fractional seq would make the log slice from the wrong end and re-send a
+  // whole session to a client that already had it.
+  expect(readCursors({ s1: 0, s2: 41 })).toEqual({ s1: 0, s2: 41 });
+  expect(readCursors({ s1: -1, s2: 2.5, s3: "9", s4: null, s5: NaN })).toEqual({});
+  // A client too old to send them, or one with nothing to catch up on.
+  expect(readCursors(undefined)).toEqual({});
+  expect(readCursors("nonsense")).toEqual({});
+  expect(readCursors(null)).toEqual({});
 });

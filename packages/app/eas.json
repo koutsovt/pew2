@@ -1,8 +1,7 @@
 {
   "cli": {
     "version": ">= 12.0.0",
-    "appVersionSource": "remote",
-    "promptToConfigurePushNotifications": false
+    "appVersionSource": "remote"
   },
   "build": {
     "apk": {
@@ -27,6 +26,7 @@
       "distribution": "store",
       "autoIncrement": true,
       "ios": {
+        "image": "macos-tahoe-26.4-xcode-26.4",
         "simulator": false
       },
       "android": {

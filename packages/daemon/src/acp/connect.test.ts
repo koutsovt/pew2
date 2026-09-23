@@ -3,7 +3,10 @@
  *
  * `connectProvider` spawns a real process, so most of it is not unit-testable
  * without one. What is tested here is the part that had no bound at all: an
- * agent that never answers `initialize`.
+ * agent that never answers `initialize` — plus a few real spawns: an agent that
+ * dies or breaks the connection during the handshake, and the process lifecycle
+ * (a child gets its own process group, and closing the session takes that whole
+ * group with it).
  *
  * That case is not hypothetical. A corrupt `npx` cache, an agent that prompts
  * for login on a stdin nobody is reading, or a package that simply does not
@@ -13,7 +16,17 @@
  * on a loading skeleton with nothing in the log.
  */
 import { expect, test } from "bun:test";
-import { HANDSHAKE_TIMEOUT_MARKER, restoreMethodFor, withTimeout } from "./connect.js";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  connectProvider,
+  HANDSHAKE_TIMEOUT_MARKER,
+  restoreMethodFor,
+  withTimeout,
+} from "./connect.js";
+import type { LoadedProvider } from "../providers/registry.js";
 
 test("a promise that never settles is rejected with the caller's error", async () => {
   const never = new Promise<string>(() => {});
@@ -85,6 +98,33 @@ test("the timeout marker survives being carried through a rejection", async () =
   expect("'goose' was not found on PATH").not.toContain(HANDSHAKE_TIMEOUT_MARKER);
 });
 
+test("a dead process names its own exit code, not just 'connection closed'", async () => {
+  // A real spawn, deliberately: `failureContext()`'s exit-code/signal reporting
+  // only exists to answer "did the process crash, or is something merely
+  // hung?", and that is only true of a real child process's real exit — a fake
+  // promise rejection can't stand in for it. A command that exits immediately
+  // with a known code is cheap enough to run as a unit test.
+  //
+  // Redirected because connecting records the child in the daemon's own state
+  // directory, and a test must not write to the one a live daemon is reading.
+  const previousHome = process.env.PEW2_HOME;
+  process.env.PEW2_HOME = mkdtempSync(join(tmpdir(), "pew2-connect-"));
+
+  try {
+    await expect(
+      connectProvider({
+        provider: { ...echoProvider, command: "bun", args: ["-e", "process.exit(7)"] },
+        cwd: tmpdir(),
+        onUpdate: () => {},
+        onPermissionRequest: () => {},
+      }),
+    ).rejects.toThrow("exited with code 7");
+  } finally {
+    if (previousHome === undefined) delete process.env.PEW2_HOME;
+    else process.env.PEW2_HOME = previousHome;
+  }
+});
+
 test("a conversation already on screen is restored without a second copy of it", () => {
   // The daemon paints every thread from its own cache before the agent attaches,
   // then discards whatever the agent replays on top. Against GG Coder that was
@@ -107,4 +147,97 @@ test("without the transcript, the replay is the only way to draw the thread", ()
   // never fills — worse than the 500ms it saves.
   expect(restoreMethodFor(false, true)).toBe("session/load");
   expect(restoreMethodFor(false, false)).toBe("session/load");
+});
+
+/** The echo agent: a real ACP peer that needs no key, no network and no PATH. */
+const echoProvider: LoadedProvider = {
+  manifest: { id: "echo", name: "echo" } as LoadedProvider["manifest"],
+  source: "<test>",
+  command: "bun",
+  args: ["run", new URL("../testing/echo-agent.ts", import.meta.url).pathname],
+  missingEnv: [],
+  commandMissing: false,
+};
+
+// Process groups and `ps` are POSIX; the Windows path kills with `taskkill /T`
+// and cannot be asserted the same way.
+const posixTest = process.platform === "win32" ? test.skip : test;
+
+posixTest("a spawned agent is its own process group, and close() ends the group", async () => {
+  // Both halves of the same bug. Five bundled providers launch through `npx`,
+  // so the process spawned here is a launcher and the agent is its child:
+  // signalling only the launcher reparented the real agent to pid 1, where it
+  // ran until the machine rebooted. `detached` is the only thing that creates
+  // the group, and without the group there is nothing for `close()` to address.
+  //
+  // Redirected because connecting records the child in the daemon's own state
+  // directory, and a test must not write to the one a live daemon is reading.
+  const previousHome = process.env.PEW2_HOME;
+  process.env.PEW2_HOME = mkdtempSync(join(tmpdir(), "pew2-connect-"));
+
+  try {
+    const handle = await connectProvider({
+      provider: echoProvider,
+      cwd: tmpdir(),
+      onUpdate: () => {},
+      onPermissionRequest: () => {},
+    });
+
+    const pid = handle.child.pid!;
+    const exited = new Promise<void>((resolve) => handle.child.once("exit", () => resolve()));
+
+    // Its own group leader: the group id equals the pid, so `kill(-pid)` reaches
+    // this agent and its descendants and nothing else on the machine.
+    const group = Number(
+      execFileSync("ps", ["-o", "pgid=", "-p", String(pid)]).toString().trim(),
+    );
+    expect(group).toBe(pid);
+
+    handle.close();
+    await exited;
+  } finally {
+    if (previousHome === undefined) delete process.env.PEW2_HOME;
+    else process.env.PEW2_HOME = previousHome;
+  }
+});
+
+posixTest("an agent that fails the handshake but stays alive is shut down", async () => {
+  // Closing stdout ends the ACP connection, so the handshake fails at once, yet
+  // the process lives on. Before, only a *timed-out* handshake stopped the
+  // child, so every retry from the phone left one more of these running.
+  const previousHome = process.env.PEW2_HOME;
+  const home = mkdtempSync(join(tmpdir(), "pew2-connect-"));
+  process.env.PEW2_HOME = home;
+  const pidFile = join(home, "agent.pid");
+  // `exec` keeps one pid throughout, so the recorded pid is the one to check.
+  const script = `echo $$ > '${pidFile}'; exec 1>&-; exec sleep 30`;
+
+  try {
+    await expect(
+      connectProvider({
+        provider: { ...echoProvider, command: "sh", args: ["-c", script] },
+        cwd: tmpdir(),
+        onUpdate: () => {},
+        onPermissionRequest: () => {},
+      }),
+    ).rejects.toThrow("failed to start");
+
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    const isAlive = () => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const deadline = Date.now() + 2000;
+    while (isAlive() && Date.now() < deadline) await Bun.sleep(25);
+    const alive = isAlive();
+    if (alive) process.kill(pid, "SIGKILL");
+    expect(alive).toBe(false);
+  } finally {
+    if (previousHome === undefined) delete process.env.PEW2_HOME;
+    else process.env.PEW2_HOME = previousHome;
+  }
 });

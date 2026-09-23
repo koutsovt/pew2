@@ -44,6 +44,20 @@ export interface PairView {
   port: number;
   daemonRunning: boolean;
   rotated: boolean;
+  /**
+   * The phone this code replaced, when printing it re-minted a claimed pairing.
+   *
+   * Naming it is what stops an unasked-for rotation reading as the tool losing
+   * state: the previous phone stops working the moment this screen appears, and
+   * the person looking at it is the only one who can tell whether that was the
+   * point.
+   *
+   * Already a display label rather than a raw id. The caller applies
+   * `deviceLabel`, which lives beside the command that also prints it on the
+   * paired line — importing it here would close a cycle, since that module
+   * already depends on this one.
+   */
+  supersededDevice?: string;
 }
 
 export interface RenderOptions {
@@ -326,7 +340,12 @@ export function renderPair(
     const g = options.glyph ?? glyphs();
     lines.push(
       rail(options).bar(),
-      `${g_}${s.hex(PALETTE.warning, g.warn)} ${s.dim("token rotated — devices paired before now must scan again")}`,
+      // Named when one exists. A pairing this call took from a specific phone
+      // deserves to say which, rather than a general warning that leaves the
+      // user working out whether it means them.
+      view.supersededDevice
+        ? `${g_}${s.hex(PALETTE.warning, g.warn)} ${s.dim(`new code — ${view.supersededDevice} is unpaired and must scan again`)}`
+        : `${g_}${s.hex(PALETTE.warning, g.warn)} ${s.dim("token rotated — devices paired before now must scan again")}`,
     );
   }
 

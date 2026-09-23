@@ -8,30 +8,36 @@
  * The approval sheet is the reason this app exists, so it is a blocking,
  * unmissable surface rather than an inline row that can scroll away.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Animated,
   AppState,
-  Easing,
   Keyboard,
-  PanResponder,
   Platform,
   Pressable,
   StyleSheet,
   Text,
   View,
 } from "react-native";
+import { Gesture, GestureDetector, GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { KeyboardProvider, useKeyboardHandler } from "react-native-keyboard-controller";
 import Reanimated, {
+  cancelAnimation,
+  Easing,
+  runOnJS,
   useAnimatedStyle,
   useSharedValue,
+  withSpring,
+  withTiming,
 } from "react-native-reanimated";
 import { StatusBar } from "expo-status-bar";
-import { Ionicons } from "@expo/vector-icons";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import { theme } from "./src/theme";
 import { useDaemon, type Provider, type TurnFinished } from "./src/useDaemon";
+import { projectDrawerRows } from "./src/historyMetadata";
+import { restorePresentation } from "./src/restoreState";
 import { currentTool } from "./src/activity";
 import { dockHeightFor, recordDockHeight, type DockHeights } from "./src/dockHeight";
 import { finishedNotice } from "./src/notificationPolicy";
@@ -39,10 +45,12 @@ import {
   ensureNotificationPermission,
   notify,
   onNotificationChoice,
+  setOpenConversation,
   type NotificationChoice,
 } from "./src/ui/notifier";
+import { pushAddress } from "./src/ui/push";
 import { Orb } from "./src/ui/Orb";
-import { Composer, type ComposerHandle } from "./src/ui/Composer";
+import { ComposerDock, type ComposerDockHandle } from "./src/ui/ComposerDock";
 import { ChatThread, type ChatThreadRef } from "./src/ui/ChatThread";
 import { ImageResolverProvider } from "./src/ui/ChatImage";
 import { CommandSheet } from "./src/ui/CommandSheet";
@@ -52,38 +60,54 @@ import { AttachmentSheet, type AttachmentSource } from "./src/ui/AttachmentSheet
 import { addAttachments, MAX_ATTACHMENTS, type PendingAttachment } from "./src/attachments";
 import { pickFiles, pickPhotos, takePhoto } from "./src/ui/attachmentPicker";
 import { useDictation } from "./src/ui/useDictation";
-import { ContextBar } from "./src/ui/ContextBar";
 import { ApprovalSheet } from "./src/ui/ApprovalSheet";
 import { ThoughtSheet } from "./src/ui/ThoughtSheet";
 import { applyCommand, type SlashCommand } from "./src/slashCommands";
-import { CircleButton, Pill } from "./src/ui/controls";
+import { CircleButton } from "./src/ui/controls";
 import { haptics } from "./src/ui/haptics";
 import { Sidebar, DRAWER_WIDTH } from "./src/ui/Sidebar";
-import { projectsForProvider } from "./src/projects";
+import { ConnectionSheet } from "./src/ui/ConnectionSheet";
+import { ContextDetailsSheet } from "./src/ui/ContextDetailsSheet";
+import { projectsForProvider, projectSourceKey } from "./src/projects";
 import { greetingFor, hashSeed } from "./src/greeting";
 import { showsStop } from "./src/composerState";
 import { ConfigPicker, summarise, valueName } from "./src/ui/ConfigPicker";
 import { useReducedMotion } from "./src/ui/useReducedMotion";
-import { ProgressiveBlur } from "./src/ui/ProgressiveBlur";
-import { withLayoutX, type PillX } from "./src/ui/pillAnchor";
+import { CanvasCover } from "./src/ui/CanvasCover";
+import type { ComposerAnchor, ComposerSelector } from "./src/ui/Composer";
 import { PairingScreen } from "./src/ui/PairingScreen";
 import { LaunchScreen } from "./src/ui/LaunchScreen";
 import { clearPairing, loadPairing, savePairing, type Pairing } from "./src/pairing";
+import { clearCachedProviders } from "./src/preferences";
+import * as SplashScreen from "expo-splash-screen";
 import { clearCrash, readCrash } from "./src/crashLog";
 import * as Clipboard from "expo-clipboard";
-import {
-  useFonts,
-  BitcountPropSingle_400Regular,
-  BitcountPropSingle_600SemiBold,
-  BitcountPropSingle_700Bold,
-} from "@expo-google-fonts/bitcount-prop-single";
+// `useFonts` from expo-font rather than the one the google-fonts package ships.
+// They look identical, but that one always starts at `false` and waits for an
+// effect, while this one seeds its state from `isLoaded` synchronously — so a
+// face already registered from an earlier mount is reported ready on the first
+// render instead of costing another frame.
+import { useFonts } from "expo-font";
+// The faces themselves come from their own subpaths rather than the package
+// root. The root barrel re-exports all nine weights, and because each one
+// `require`s its own .ttf, importing three through it bundled 3MB of font — six
+// faces the app never asks for. Deep imports bring in only what is named here.
+import { BitcountPropSingle_400Regular } from "@expo-google-fonts/bitcount-prop-single/400Regular";
+import { BitcountPropSingle_600SemiBold } from "@expo-google-fonts/bitcount-prop-single/600SemiBold";
+import { BitcountPropSingle_700Bold } from "@expo-google-fonts/bitcount-prop-single/700Bold";
 
 export default function App() {
-  const [fontsLoaded] = useFonts({
+  const [fontsLoaded, fontError] = useFonts({
     BitcountPropSingle_400Regular,
     BitcountPropSingle_600SemiBold,
     BitcountPropSingle_700Bold,
   });
+
+  // An error counts as settled. The faces load from the app bundle rather than
+  // the network, so this is quick, but the display font is not worth never
+  // opening the app over and the fallback is only a metrics difference. Without
+  // this a failed load holds the tree forever behind a splash that never lifts.
+  const fontsSettled = fontsLoaded || fontError != null;
 
   // What killed the app last time, if anything did.
   //
@@ -109,8 +133,9 @@ export default function App() {
 
   // Hold on the canvas colour rather than rendering with the fallback face:
   // the two have different metrics, so titles would visibly reflow the moment
-  // the display font arrives.
-  if (!fontsLoaded) {
+  // the display font arrives. The native splash is still up over this, so what
+  // the user sees is the splash rather than an empty rectangle.
+  if (!fontsSettled) {
     return (
       <SafeAreaProvider>
         <View style={{ flex: 1, backgroundColor: theme.color.bg }} />
@@ -124,14 +149,21 @@ export default function App() {
     // app becomes a blank rectangle — no message, and nothing a tester on a
     // TestFlight build can put in a report.
     <ErrorBoundary>
-      {/* Every keyboard-driven element in this app moves on the keyboard's own
-          frame-by-frame position rather than a JS animation started alongside
-          it. Coordinating two animation systems made the thread land twice. */}
-      <KeyboardProvider>
-        <SafeAreaProvider>
-          <Root />
-        </SafeAreaProvider>
-      </KeyboardProvider>
+      {/* Required for any gesture in the app to be recognised at all: it is the
+          native touch target every GestureDetector attaches under, and without
+          it a sheet's drag-to-dismiss silently does nothing. Inside the
+          boundary, like every other provider, so a throw from it still reaches
+          a screen with a message on it. */}
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        {/* Every keyboard-driven element in this app moves on the keyboard's own
+            frame-by-frame position rather than a JS animation started alongside
+            it. Coordinating two animation systems made the thread land twice. */}
+        <KeyboardProvider>
+          <SafeAreaProvider>
+            <Root />
+          </SafeAreaProvider>
+        </KeyboardProvider>
+      </GestureHandlerRootView>
     </ErrorBoundary>
   );
 }
@@ -172,6 +204,26 @@ function Root() {
     };
   }, []);
 
+  // Lift the splash only once there is a real screen behind it.
+  //
+  // This is the first moment the app knows which screen it is: the conversation
+  // for a paired device, the launch screen otherwise. `index.ts` holds the
+  // splash from launch, and every path that sets `checked` — including the
+  // keychain failures above, which resolve to "not paired" rather than
+  // rejecting — arrives here, so there is no route that leaves it up.
+  //
+  // One frame later, not immediately: `hideAsync` takes effect straight away,
+  // and calling it during the commit that renders the first screen can uncover
+  // the window before that screen has been drawn into it — a flash of empty
+  // canvas, which is the exact thing the splash is being held to prevent.
+  useEffect(() => {
+    if (!checked) return;
+    const frame = requestAnimationFrame(() => {
+      void SplashScreen.hideAsync().catch(() => {});
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [checked]);
+
   const pair = useCallback((next: Pairing) => {
     // Connect regardless of whether the keychain accepted it. A locked or
     // unavailable keychain costs the user a re-pair next launch; blocking on it
@@ -184,7 +236,11 @@ function Root() {
   const unpair = useCallback(() => {
     // Same reasoning inverted: forget it locally even if the delete failed, or
     // the confirmed "Forget" action would appear to do nothing.
-    void clearPairing()
+    //
+    // The remembered agent list goes with it. It describes one specific machine,
+    // so keeping it would offer the next computer agents it may not have — and
+    // "Forget this computer" ought to mean it.
+    void Promise.all([clearPairing(), clearCachedProviders()])
       .catch(() => {})
       .then(() => {
         setPairing(null);
@@ -215,21 +271,48 @@ const ORB_REST_SIZE = 96;
 const ORB_SETTLED_SCALE = 56 / ORB_REST_SIZE;
 
 /**
+ * How the drawer finishes a movement it was handed.
+ *
+ * Barely underdamped, unlike the sheets: the drawer stops against the screen
+ * edge with a full conversation riding on it, and visible overshoot there reads
+ * as the whole app sloshing rather than as a panel arriving.
+ */
+const DRAWER_SETTLE = { duration: 340, dampingRatio: 0.95 } as const;
+
+/**
+ * A flick worth committing to, in points per second.
+ *
+ * The same threshold the drawer has always used, restated in the units gesture
+ * handler reports — it gives velocity per second where `PanResponder` gave it
+ * per millisecond, so the old `0.4` is this.
+ */
+const FLICK = 400;
+
+/**
+ * The curve iOS moves its keyboard along.
+ *
+ * UIKit animates the keyboard with a private curve — `UIViewAnimationCurve(7)`,
+ * which has no public constant and is not any of the four documented ones. This
+ * bezier is the long-standing community match for it, and it only matters when
+ * the pane is animating itself because the platform has not reported the
+ * keyboard's real position; when frames do arrive they overwrite this anyway.
+ */
+const KEYBOARD_CURVE = Easing.bezier(0.17, 0.59, 0.4, 0.77);
+
+/**
  * Raises the thread and the composer by exactly the visible keyboard's height,
  * and returns a second style for content that is centred rather than
  * bottom-anchored.
  *
- * Written from a worklet on every frame of the keyboard's own animation, so the
- * two move in perfect step. No JS re-render can land halfway through and move
- * things a second time.
+ * Written from a worklet on the keyboard's own animation, so the two move in
+ * perfect step. No JS re-render can land halfway through and move things a
+ * second time.
  *
  * A transform, deliberately, not a height. The thread is a recycling list, and
  * `RecyclerView` answers any container resize with a full layout pass in JS — so
  * shortening the pane per frame queued sixty of them across the keyboard's
  * animation, which is the stutter. Translating moves the same pixels on the UI
- * thread and lays out nothing. This is the shape `KeyboardChatScrollView` uses;
- * that component would do it for us, but it landed in
- * react-native-keyboard-controller 1.21 and this app is on 1.18.
+ * thread and lays out nothing.
  *
  * Cross-platform by construction rather than by branch: `useKeyboardHandler`
  * calls the library's `useResizeMode`, which sets Android to `adjustResize`, and
@@ -250,14 +333,56 @@ function useKeyboardLift(bottomInset: number) {
 
   useKeyboardHandler(
     {
+      // Start the movement on the platform's own terms before a single frame
+      // has been reported.
+      //
+      // `onMove` is the good path and stays the good path — it is the keyboard's
+      // real position, sampled per frame. But it is *not guaranteed to arrive*.
+      // iOS 26 stopped delivering those frames to release builds: the library
+      // finds the keyboard by walking the window hierarchy for private UIKit
+      // class names (`UIInputSetHostView` and friends) and driving a
+      // `CADisplayLink` off the view it finds, and when that lookup comes back
+      // empty there is no per-frame anything. `onStart`/`onEnd` still fire,
+      // because those are ordinary keyboard notifications. So the pane sat
+      // still for the whole animation and then snapped — in TestFlight only,
+      // while every development build looked perfect, which is exactly the
+      // shape of the bug that was so maddening to chase.
+      //
+      // Animating here removes the dependency. `event.duration` is what the
+      // system says the keyboard will take, so the pane covers the same
+      // distance in the same time whether or not a single frame is ever
+      // reported. When they are reported, the assignment in `onMove` simply
+      // takes over — assigning to a shared value cancels whatever animation is
+      // running on it — and the exact path wins. Degrading, not branching:
+      // there is no version check to go stale.
+      onStart: (event) => {
+        "worklet";
+        const target = Math.max(0, event.height - bottomInset * event.progress);
+        if (event.duration <= 0) {
+          height.value = target;
+          progress.value = event.progress;
+          return;
+        }
+        const timing = { duration: event.duration, easing: KEYBOARD_CURVE };
+        height.value = withTiming(target, timing);
+        progress.value = withTiming(event.progress, timing);
+      },
       onMove: (event) => {
         "worklet";
         height.value = Math.max(0, event.height - bottomInset * event.progress);
         progress.value = event.progress;
       },
+      // The keyboard has stopped, so this is the authoritative position — but
+      // only assign it if it is not already there. On the fallback path the
+      // timing started in `onStart` is still running toward this exact value,
+      // and overwriting it lands the last few points as a cut instead of the
+      // end of the movement.
       onEnd: (event) => {
         "worklet";
-        height.value = Math.max(0, event.height - bottomInset * event.progress);
+        const target = Math.max(0, event.height - bottomInset * event.progress);
+        if (Math.abs(height.value - target) > 0.5) {
+          height.value = target;
+        }
         progress.value = event.progress;
       },
     },
@@ -314,6 +439,16 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
   const [choice, setChoice] = useState<NotificationChoice | undefined>(undefined);
   useEffect(() => onNotificationChoice(setChoice), []);
 
+  // Whether the daemon has somewhere to push.
+  //
+  // What stops a backgrounded Android phone announcing the same turn twice:
+  // there the socket outlives the app leaving the screen, so `session.idle`
+  // still arrives and both routes would fire. Driven by the daemon accepting
+  // the token rather than this app merely holding one — an older daemon refuses
+  // `app.push`, and suppressing the local banner for a push that can never come
+  // would leave the phone silent.
+  const pushExpected = useRef(false);
+
   /**
    * Announce a turn that ended somewhere the user cannot see it.
    *
@@ -322,7 +457,11 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
    * five-minute turn is only discovered by going back to check.
    */
   const announceTurn = useCallback((turn: TurnFinished) => {
-    const notice = finishedNotice({ ...turn, foreground: foreground.current });
+    const notice = finishedNotice({
+      ...turn,
+      foreground: foreground.current,
+      pushExpected: pushExpected.current,
+    });
     if (notice) void notify(notice);
   }, []);
 
@@ -330,8 +469,69 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
   // the stored pairing URL or the two look like different clients.
   const daemon = useDaemon(pairing.url, pairing.deviceId, pairing.key, {
     onTurnFinished: announceTurn,
+    // Supplied from here because obtaining it calls into the Expo SDK, which
+    // `useDaemon` deliberately stays clear of. What it buys: the daemon can
+    // announce a finished turn even after iOS has suspended this app and taken
+    // its socket with it — previously that banner waited for the app to be
+    // reopened, which is minutes too late to be worth anything.
+    pushAddress,
+    onPushRegistered: (registered) => {
+      pushExpected.current = registered;
+    },
   });
-  const [draft, setDraft] = useState("");
+
+  const [drawerProjection, setDrawerProjection] = useState(() => ({
+    source: daemon.sessions, rows: projectDrawerRows([], daemon.sessions),
+  }));
+  if (drawerProjection.source !== daemon.sessions) {
+    setDrawerProjection({ source: daemon.sessions, rows: projectDrawerRows(drawerProjection.rows, daemon.sessions) });
+  }
+
+  // Retry the socket the moment the app is back, rather than waiting out a
+  // backoff that was scheduled while nobody was holding the phone.
+  //
+  // Subscribed here rather than inside `useDaemon` because that module is
+  // reached by the daemon's own tests, and a `react-native` import there pulls
+  // RN's global types into the daemon's TypeScript program — where they redefine
+  // `setTimeout` and break every `.unref()` in it. `resumeNow` exists to keep
+  // that boundary while still letting this side drive the reconnect.
+  //
+  // A second listener rather than a branch in the `foreground` one above,
+  // because that one is declared before `useDaemon` runs and so has no
+  // `resumeNow` to call. Reordering the two to share a subscription would put
+  // the socket's setup above the ref that decides whether a finished turn needs
+  // a banner, which is the more delicate of the two orderings.
+  const resumeDaemon = daemon.resumeNow;
+  const setDaemonForeground = daemon.setForeground;
+  useEffect(() => {
+    setDaemonForeground(AppState.currentState === "active");
+    const subscription = AppState.addEventListener("change", (next) => {
+      setDaemonForeground(next === "active");
+      if (next === "active") resumeDaemon();
+    });
+    return () => subscription.remove();
+  }, [resumeDaemon, setDaemonForeground]);
+
+  // The rest of the hook's actions, pulled out for the same reason as
+  // `resumeDaemon` above: `daemon` is a fresh object every render (it spreads
+  // state over actions), while each function on it is stable. Naming them here
+  // lets every callback below depend on exactly what it calls, instead of on an
+  // identity that changes on every streamed chunk — which would rebuild the
+  // memoised dock and transcript cells for each token that arrives.
+  const {
+    answer: answerDaemon,
+    leave: leaveDaemon,
+    openSession: openDaemonSession,
+    prompt: promptDaemon,
+    selectProject: selectDaemonProject,
+    start: startDaemon,
+  } = daemon;
+
+  // Tell the notification layer which conversation is open, so a push that
+  // arrives for the one already on screen is dropped instead of covering the
+  // reply it is announcing. The daemon pushes without knowing what this phone is
+  // showing — only this side can know that.
+  useEffect(() => setOpenConversation(daemon.sessionId), [daemon.sessionId]);
   // Files staged for the next message. Cleared with the draft on send, because
   // the two are one message.
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
@@ -340,6 +540,16 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
   attachmentsRef.current = attachments;
   const [attachOpen, setAttachOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [connectionOpen, setConnectionOpen] = useState(false);
+  const [contextOpen, setContextOpen] = useState(false);
+  const openContext = useCallback(() => { Keyboard.dismiss(); setContextOpen(true); }, []);
+  const closeContext = useCallback(() => setContextOpen(false), []);
+  const openConnection = useCallback(() => {
+    Keyboard.dismiss();
+    setMenuOpen(false);
+    setConnectionOpen(true);
+  }, []);
+  const closeConnection = useCallback(() => setConnectionOpen(false), []);
   // Which pill's menu is open, and where that pill sits, so the menu opens
   // under it instead of always at the gutter.
   const [picker, setPicker] = useState<"model" | "mode" | null>(null);
@@ -349,7 +559,13 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
   // so the sheet lives outside the recycling list — a cell scrolled off screen
   // must not take the sheet down with it.
   const [thought, setThought] = useState<string | null>(null);
-  const composer = useRef<ComposerHandle>(null);
+  // The draft lives inside the dock, not here.
+  //
+  // Holding it at the root meant every keystroke re-rendered the entire app,
+  // and the composer's own growth animation then had to share the JS thread
+  // with that work — which is what made the box lag the caret on every wrapped
+  // line. This handle is how the root still reaches text it no longer owns.
+  const composer = useRef<ComposerDockHandle>(null);
   /** The keyboard is up, so the composer owns the screen. */
   const [typing, setTyping] = useState(false);
   // Measured so the thread's top inset always matches the real nav height.
@@ -379,12 +595,32 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
   const [atBottom, setAtBottom] = useState(true);
   const jumpOpacity = useRef(new Animated.Value(0)).current;
 
-  const [pillX, setPillX] = useState<PillX>({
-    model: theme.gutter,
-    mode: theme.gutter,
-  });
+  const [pickerAnchor, setPickerAnchor] = useState<ComposerAnchor>();
+  const openComposerPicker = useCallback((kind: "model" | "mode", anchor: ComposerAnchor) => {
+    setPickerAnchor(anchor);
+    setPicker(kind);
+  }, []);
   const reduceMotion = useReducedMotion();
-  const drawer = useRef(new Animated.Value(0)).current;
+  // How far the drawer is uncovered, 0 to 1.
+  //
+  // A shared value rather than an `Animated.Value`, and that is not a detail
+  // here: this app streams an agent's output over a websocket while you use it,
+  // so the JS thread is the one thing guaranteed to be busy. The drawer used to
+  // be dragged from JS — a `PanResponder` calling `setValue` per touch event —
+  // so it dropped frames exactly while a turn was arriving, which is exactly
+  // when you reach for it. Nothing below re-renders as it moves.
+  const drawer$ = useSharedValue(0);
+  // How fast the finger was travelling when it let go, in drawer-widths per
+  // second, handed to the spring that finishes the movement. Zero for every
+  // other way in: a tap on the hamburger has no velocity to inherit.
+  //
+  // A plain ref rather than a shared value, because this is the one number that
+  // genuinely has to cross threads. A shared value written from the gesture and
+  // read back on the JS side syncs asynchronously — the settle would sometimes
+  // read the previous gesture's velocity, or zero. Set through the same
+  // `runOnJS` hop that dispatches the release, so it is always ordered before
+  // the read.
+  const fling = useRef(0);
 
   // The agent on screen. Before an explicit choice this is the one used last on
   // this device, resolved by the hook, so re-opening the app lands where the
@@ -411,19 +647,35 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
   // Projects the selected agent has worked in, and which one the drawer is
   // narrowed to. Derived here rather than in the drawer so both the list and
   // the empty state read from one answer.
+  //
+  // Keyed on the fields that can actually change the answer rather than on the
+  // sessions array itself, which is rebuilt on every streamed chunk. See
+  // `projectSourceKey`: `daemon.sessions` is still what the computation reads,
+  // but it is no longer what decides whether to run it.
+  const activeId = active?.id;
+  const daemonSessions = daemon.sessions;
+  const projectKey = projectSourceKey(daemonSessions, activeId);
   const projects = useMemo(
-    () => projectsForProvider(daemon.projects[active?.id ?? ""], daemon.sessions, active?.id),
-    [daemon.projects, daemon.sessions, active?.id],
+    () => projectsForProvider(daemon.projects[activeId ?? ""], daemonSessions, activeId),
+    // `projectKey` stands in for `daemonSessions` on purpose — the array is
+    // rebuilt on every streamed chunk, and listing it would recompute the fold
+    // for every token that arrives. The rule cannot see that one summarises the
+    // other, so this is the one place it is overruled by hand.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [daemon.projects, projectKey, activeId],
   );
-  const selectedProjectPath = active ? daemon.projectPath[active.id] : undefined;
+  const selectedProjectPath = activeId ? daemon.projectPath[activeId] : undefined;
   const selectProject = useCallback(
     (path?: string) => {
-      if (active) daemon.selectProject(active.id, path);
+      if (activeId) selectDaemonProject(activeId, path);
     },
-    [active?.id, daemon.selectProject],
+    [activeId, selectDaemonProject],
   );
 
   const inThread = daemon.turns.length > 0;
+  const sessionTitle = daemon.restoreTarget?.title
+    ?? daemonSessions.find((session) => session.id === (daemon.sessionId ?? threadKey))?.title
+    ?? "New conversation";
 
   // Where the reading area begins and ends: under the nav, and above the
   // composer. Both fall back to the resting height of the thing they clear,
@@ -432,7 +684,7 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
   const threadTop = insets.top + (navHeight || theme.space(12)) + theme.space(2);
   // Mirrors `styles.dock`: the composer at rest, plus that view's own padding.
   const restingDockHeight =
-    theme.size.composerCollapsed + theme.space(2) + (insets.bottom + theme.space(2));
+    theme.size.composerResting + theme.space(2) + (insets.bottom + theme.space(2));
   // The height for the state on screen now. Falls back to the other state's
   // measurement before this one has ever been measured — which is only the very
   // first keyboard open of a launch — and to the analytic resting height before
@@ -491,6 +743,10 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
   const { model, mode: modeOption, level } = summarise(daemon.configOptions);
   // Never let one selector drive two pills.
   const mode = modeOption && modeOption.id !== model?.id ? modeOption : undefined;
+  const composerSelectors = useMemo<ComposerSelector[]>(() => [
+    ...(model ? [{ id: "model", value: "Model", label: `Model: ${valueName(model) ?? "Not reported"}${level ? `, ${valueName(level)}` : ""}`, onPress: (anchor: ComposerAnchor) => openComposerPicker("model", anchor) }] : []),
+    ...(mode ? [{ id: "mode", value: valueName(mode) ?? mode.name, label: `${mode.name}: ${valueName(mode) ?? "Not reported"}`, onPress: (anchor: ComposerAnchor) => openComposerPicker("mode", anchor) }] : []),
+  ], [model, mode, level, openComposerPicker]);
 
   // Feedback for things that happen on their own, rather than because a finger
   // touched the screen. This is the point of a remote control: the agent runs
@@ -537,15 +793,39 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
   // Push, not overlay: the conversation slides right to uncover the drawer, so
   // both surfaces stay part of one layout instead of becoming a modal layer.
   // Shared with the edge gesture, which hands the drawer over mid-drag.
+  //
+  // A spring rather than the fixed 280ms curve this used to be, for the same
+  // reason the sheets are springs: the drawer is most often released from a
+  // finger, and a fixed curve throws away how fast that finger was moving. A
+  // flick and a slow push now finish at the speeds they were given.
   const settleDrawer = useCallback(
-    (open: boolean) =>
-      Animated.timing(drawer, {
-        toValue: open ? 1 : 0,
-        duration: reduceMotion ? 0 : 280,
-        easing: Easing.out(Easing.cubic),
-        useNativeDriver: true,
-      }).start(),
-    [drawer, reduceMotion],
+    (open: boolean) => {
+      // Consumed, not just read: every other route into this — the hamburger, a
+      // session picked from the drawer, a cancelled gesture — must start from
+      // rest rather than inherit the last flick's speed.
+      const velocity = fling.current;
+      fling.current = 0;
+      drawer$.value = reduceMotion
+        ? withTiming(open ? 1 : 0, { duration: 0 })
+        : withSpring(open ? 1 : 0, { ...DRAWER_SETTLE, velocity });
+    },
+    [drawer$, reduceMotion],
+  );
+
+  /**
+   * The finger let go. Runs on the JS thread, in one hop, so the velocity is
+   * recorded before anything can read it.
+   */
+  const releaseDrawer = useCallback(
+    (open: boolean, changed: boolean, velocity: number) => {
+      fling.current = velocity;
+      haptics.tap();
+      // A state change re-runs the effect above, which settles. When the drawer
+      // ends up where it started there is no change to react to, so settle here.
+      if (changed) setMenuOpen(open);
+      else settleDrawer(open);
+    },
+    [settleDrawer],
   );
 
   useEffect(() => {
@@ -555,15 +835,13 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
     // no claim on the screen — unlike the model pill, which keeps it on purpose.
     if (menuOpen) Keyboard.dismiss();
     settleDrawer(menuOpen);
-    return () => drawer.stopAnimation();
-  }, [menuOpen, settleDrawer, drawer]);
+  }, [menuOpen, settleDrawer]);
 
   // Translate only. The conversation keeps its exact size as it moves, so no
   // text reflows or resamples mid-animation.
-  const slideX = drawer.interpolate({
-    inputRange: [0, 1],
-    outputRange: [0, DRAWER_WIDTH],
-  });
+  const paneSlide = useAnimatedStyle(() => ({
+    transform: [{ translateX: drawer$.value * DRAWER_WIDTH }],
+  }));
 
   useEffect(() => {
     const animation = Animated.timing(jumpOpacity, {
@@ -575,60 +853,98 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
     return () => animation.stop();
   }, [atBottom, reduceMotion, jumpOpacity]);
 
+  /**
+   * Hide the keyboard, from a worklet.
+   *
+   * A plain JS function so the gesture captures *this* and not the `Keyboard`
+   * module: `runOnJS` still has to read its argument on the UI runtime, and a
+   * native module is not serializable to it.
+   */
+  const dismissKeyboard = useCallback(() => {
+    Keyboard.dismiss();
+  }, []);
+
   // The drawer tracks the finger in both directions: dragged out from the left
   // edge when closed, and pushed back by the uncovered pane when open. It is
   // being moved by the gesture rather than triggered by it.
   //
-  // Read through a ref because PanResponder is built once and would otherwise
-  // capture the state from that first render forever.
-  const menuOpenRef = useRef(menuOpen);
-  menuOpenRef.current = menuOpen;
-  const edgeSwipe = useRef(
-    PanResponder.create({
-      // Claim only clearly horizontal movement, and only the direction that has
-      // somewhere to go, so a scroll is never stolen.
-      onMoveShouldSetPanResponder: (_event, gesture) => {
-        const enough = Math.abs(gesture.dx) > theme.space(2);
-        const horizontal = Math.abs(gesture.dx) > Math.abs(gesture.dy) * 2;
-        const claim = enough && horizontal && gesture.dx > 0 !== menuOpenRef.current;
-        // Leaving the conversation, even a little: the drawer is a different
-        // place, so the keyboard goes the moment the drag is claimed rather
-        // than once it commits. Switching a model does not do this — that is
-        // still the same conversation.
-        //
-        // Claim time, not `onPanResponderGrant`: the strip only has to win the
-        // responder for the drawer to start moving, and a grant that is later
-        // terminated by another responder would never have dismissed at all.
-        if (claim) Keyboard.dismiss();
-        return claim;
-      },
-      onPanResponderGrant: () => {
-        // The effect below animates this same value on `menuOpen`. Stopping it
-        // here means the finger takes over from wherever it currently rests.
-        drawer.stopAnimation();
-      },
-      onPanResponderMove: (_event, gesture) => {
-        const base = menuOpenRef.current ? 1 : 0;
-        drawer.setValue(
-          Math.min(1, Math.max(0, base + gesture.dx / DRAWER_WIDTH)),
-        );
-      },
-      onPanResponderRelease: (_event, gesture) => {
-        // Signed against the one direction that has somewhere to go, so a drag
-        // that is pulled back or flicked in reverse cancels rather than
-        // committing on distance alone.
-        const toward = menuOpenRef.current ? -gesture.dx : gesture.dx;
-        const thrown = menuOpenRef.current ? -gesture.vx : gesture.vx;
-        const commit = toward > DRAWER_WIDTH / 2 || thrown > 0.4;
-        const open = commit ? !menuOpenRef.current : menuOpenRef.current;
-        haptics.tap();
-        // Unchanged state would not re-run the effect, so settle here too.
-        if (open === menuOpenRef.current) settleDrawer(open);
-        else setMenuOpen(open);
-      },
-      onPanResponderTerminate: () => settleDrawer(menuOpenRef.current),
-    }),
-  ).current;
+  // Rebuilt when `menuOpen` changes rather than read through a ref. A worklet
+  // closes over its values when it is built, so the ref that kept the old
+  // `PanResponder` honest is not just unnecessary here — reading `.current`
+  // from the UI thread would not work at all.
+  const buildEdgeSwipe = useCallback(() => {
+    // Far enough to be deliberate, short enough not to feel like a tug of war.
+    const reach = theme.space(2);
+    return (
+      Gesture.Pan()
+        // The claim rules, now enforced natively before a single frame reaches
+        // JS: only the direction that has somewhere to go, and abandoned the
+        // moment the finger commits to the vertical. The old ratio test did the
+        // same job from JS, one event late — which is how a fast scroll could
+        // still start dragging the drawer before the test caught up.
+        .activeOffsetX(menuOpen ? -reach : reach)
+        .failOffsetY([-reach, reach])
+        .onStart(() => {
+          // Leaving the conversation, even a little: the drawer is a different
+          // place, so the keyboard goes the moment the drag is claimed rather
+          // than once it commits. Switching a model does not do this — that is
+          // still the same conversation.
+          //
+          // `dismissKeyboard`, never `runOnJS(Keyboard.dismiss)`. This body is a
+          // worklet, so naming `Keyboard.dismiss` reads a property off the
+          // `Keyboard` module *on the UI runtime* — and a native module cannot
+          // be sent there. Worklets throws, and a throw on the UI thread is not
+          // catchable JS: it aborts the process. That is the whole crash — the
+          // drawer never opened because the app died on the first frame of the
+          // drag, in both directions, since both go through here.
+          runOnJS(dismissKeyboard)();
+          // The effect above animates this same value on `menuOpen`. Cancelling
+          // here means the finger takes over from where the drawer currently
+          // rests rather than from where it was heading.
+          cancelAnimation(drawer$);
+        })
+        .onUpdate((event) => {
+          const base = menuOpen ? 1 : 0;
+          drawer$.value = Math.min(
+            1,
+            Math.max(0, base + event.translationX / DRAWER_WIDTH),
+          );
+        })
+        .onEnd((event) => {
+          // Signed against the one direction that has somewhere to go, so a drag
+          // that is pulled back or flicked in reverse cancels rather than
+          // committing on distance alone.
+          const toward = menuOpen ? -event.translationX : event.translationX;
+          const thrown = menuOpen ? -event.velocityX : event.velocityX;
+          const commit = toward > DRAWER_WIDTH / 2 || thrown > FLICK;
+          const open = commit ? !menuOpen : menuOpen;
+          runOnJS(releaseDrawer)(
+            open,
+            open !== menuOpen,
+            // Normalised to the same 0..1 scale the drawer moves on, or the
+            // spring would be handed a number in points and leave immediately.
+            event.velocityX / DRAWER_WIDTH,
+          );
+        })
+        .onFinalize((_event, success) => {
+          if (success) return;
+          // Cancelled rather than released: a system gesture took the touch, or
+          // the app lost it. Put the drawer back where it was instead of leaving
+          // it stranded part way across. Skipped when it never actually moved,
+          // which is every drag that failed the offset tests.
+          if (drawer$.value === (menuOpen ? 1 : 0)) return;
+          runOnJS(settleDrawer)(menuOpen);
+        })
+    );
+  }, [menuOpen, drawer$, releaseDrawer, settleDrawer, dismissKeyboard]);
+
+  // Two instances of the same gesture rather than one shared between the edge
+  // strip and the overlay. A GestureDetector stamps its own handler tag onto the
+  // object it is given, so handing the same one to two detectors leaves whichever
+  // mounted last owning the tag — and since these two swap places every time the
+  // drawer opens or closes, the loser is the one still on screen.
+  const edgeSwipeClosed = useMemo(() => buildEdgeSwipe(), [buildEdgeSwipe]);
+  const edgeSwipeOpen = useMemo(() => buildEdgeSwipe(), [buildEdgeSwipe]);
 
   // Belt and braces for every other way in: the hamburger, a swipe that the
   // strip lost, a session opened from the drawer. The drawer is never the place
@@ -658,15 +974,32 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
 
   const openSession = useCallback(
     (id: string) => {
-      // Remounts the thread so it re-arms at this transcript's own bottom.
-      // Deliberately not `daemon.sessionId`: a fresh conversation renders its
-      // optimistic first prompt before the daemon assigns an id, and keying on
-      // that would tear the list down mid-reply the moment the id landed.
-      setThreadKey(id);
-      daemon.openSession(id);
+      // Closing the drawer is urgent; swapping the transcript underneath it is
+      // not, and they are separated here because they used to be one render.
+      //
+      // The spring that closes the drawer is started by an effect on
+      // `menuOpen`, and effects run after the commit — so it could not begin
+      // until React had finished the work in the same batch. That work is a
+      // whole new transcript: `threadKey` changes, the list remounts, and every
+      // turn in the conversation mounts and parses its markdown. The drawer
+      // therefore stayed still from the tap until all of that had landed, and
+      // only then started moving. That pause is the stagger — not a slow
+      // animation, a late one, and worst on the longest conversations.
+      //
+      // Marked non-urgent, the transcript renders in its own pass. The tap now
+      // commits nothing but `menuOpen`, the effect fires, and the drawer is
+      // already travelling while the turns are built behind it.
       setMenuOpen(false);
+      startTransition(() => {
+        // Remounts the thread so it re-arms at this transcript's own bottom.
+        // Deliberately not `daemon.sessionId`: a fresh conversation renders its
+        // optimistic first prompt before the daemon assigns an id, and keying on
+        // that would tear the list down mid-reply the moment the id landed.
+        setThreadKey(id);
+        openDaemonSession(id);
+      });
     },
-    [daemon.openSession],
+    [openDaemonSession],
   );
 
   // Deferred until the conversation the banner named is in the list: a banner
@@ -674,73 +1007,115 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
   // and addressing an unknown id is a no-op that would silently lose it.
   useEffect(() => {
     if (!choice) return;
-    if (!daemon.sessions.some((session) => session.id === choice.sessionId)) return;
+    if (!daemonSessions.some((session) => session.id === choice.sessionId)) return;
     setChoice(undefined);
     if (choice.text) {
       // Replied from the banner: answer that agent where it is and leave the
       // user wherever they were. Being pulled into another project because you
       // dashed off one line is the thing the reply box exists to avoid.
-      if (daemon.prompt(choice.text, choice.sessionId)) {
+      if (promptDaemon(choice.text, choice.sessionId)) {
         haptics.sent();
         return;
       }
       // The conversation has to be reloaded first (the daemon was restarted).
       // Open it with the reply waiting in the composer rather than dropping
       // what was typed: one tap to send beats losing it silently.
-      setDraft(choice.text);
+      composer.current?.setDraft(choice.text);
     }
     openSession(choice.sessionId);
-  }, [choice, daemon.sessions, daemon.prompt, openSession]);
+  }, [choice, daemonSessions, promptDaemon, openSession]);
 
   /**
    * Dictation writes straight into the draft.
    *
-   * `draft` is read through a getter rather than passed as a value: it changes
-   * on every result, and a dependency on it would tear down the recogniser's
-   * listeners mid-sentence.
+   * Both sides go through the dock's handle, which is stable: the draft is not
+   * state here any more, so there is nothing on this component for a
+   * dependency to track and nothing to tear the recogniser's listeners down
+   * mid-sentence.
    */
-  const draftRef = useRef(draft);
-  draftRef.current = draft;
   const dictation = useDictation({
-    draft: useCallback(() => draftRef.current, []),
-    onDraftChange: setDraft,
+    draft: useCallback(() => composer.current?.getDraft() ?? "", []),
+    onDraftChange: useCallback((text: string) => composer.current?.setDraft(text), []),
     onMessage: useCallback((message: string) => {
       Alert.alert("Dictation", message);
     }, []),
   });
+  // Same reason as the daemon actions above: the hook's object is new each
+  // render, the function on it is not.
+  const cancelDictation = dictation.cancel;
 
-  const send = useCallback(() => {
-    const text = draft.trim();
-    // A photo on its own is a message; "look at this" is implied by attaching it.
-    if (!text && attachments.length === 0) return;
+  // Handed the text by the dock, which owns it.
+  //
+  // Answers whether the message went. The dock clears the draft on true and
+  // keeps it on false, so a send refused below — no agent available to start a
+  // conversation with — leaves the words in the box instead of destroying a
+  // message that was never delivered.
+  const send = useCallback(
+    (text: string): boolean => {
+      // A photo on its own is a message; "look at this" is implied by attaching it.
+      if (!text && attachmentsRef.current.length === 0) return false;
+      const staged = attachmentsRef.current;
 
-    // Whatever the recogniser still holds is not going into a message that has
-    // already gone, and a live mic outliving the send is what leaves the OS
-    // recording indicator on.
-    dictation.cancel();
+      if (!daemon.sessionId && !active?.available) return false;
 
-    // Asked at the moment it earns itself: the user is about to wait on an
-    // agent, which is the only thing this app notifies about. Not awaited — the
-    // prompt must go out whatever the system decides.
-    void ensureNotificationPermission();
+      // Whatever the recogniser still holds is not going into a message that has
+      // already gone, and a live mic outliving the send is what leaves the OS
+      // recording indicator on.
+      cancelDictation();
 
-    if (daemon.sessionId) {
-      daemon.prompt(text, undefined, attachments);
-    } else {
-      // No session yet: start one with the chosen available agent and let the
-      // daemon deliver this prompt as soon as it is ready.
-      if (!active?.available) return;
-      daemon.start(active.id, text, attachments);
-    }
-    setDraft("");
-    setAttachments([]);
-  }, [draft, attachments, dictation.cancel, daemon.sessionId, daemon.prompt, daemon.start, active]);
+      // Asked at the moment it earns itself: the user is about to wait on an
+      // agent, which is the only thing this app notifies about. Not awaited — the
+      // prompt must go out whatever the system decides.
+      void ensureNotificationPermission();
+
+      // Offline the message is queued rather than sent, which still counts as
+      // taken: it is on screen, marked as waiting, and goes out on reconnect.
+      // A false here is the rare genuine refusal — the outbox is full — and the
+      // draft and its attachments stay put, because destroying a message that
+      // was never delivered is the one outcome there is no way back from.
+      const taken = daemon.sessionId
+        ? promptDaemon(text, undefined, staged)
+        : // No session yet: start one with the chosen available agent and let
+          // the daemon deliver this prompt as soon as it is ready.
+          startDaemon(active!.id, text, staged);
+      if (!taken) return false;
+      setAttachments([]);
+      return true;
+    },
+    // Attachments are read through their ref, so staging a photo does not
+    // rebuild this and re-render the memoised dock beneath it.
+    [cancelDictation, daemon.sessionId, promptDaemon, startDaemon, active],
+  );
+
+  /**
+   * Sending a failed prompt again, from the transcript.
+   *
+   * The same path as the composer, deliberately: a retry has to start a
+   * conversation when the daemon was restarted under it, and has to queue when
+   * the phone has no signal, exactly as typing it out by hand would.
+   *
+   * What it cannot bring back is the failed message's attachments — they left
+   * the composer when it was sent. It carries whatever is staged now, which is
+   * the same rule the composer follows.
+   *
+   * A refusal has one cause the user can act on: no agent is available to open
+   * a conversation with. That lands the prompt in the composer rather than
+   * nowhere, so the tap is never silent.
+   */
+  const retrySend = useCallback(
+    (text: string) => {
+      if (send(text)) return;
+      composer.current?.setDraft(text);
+      composer.current?.focus();
+    },
+    [send],
+  );
 
   // A mic left listening across a session switch would put the next sentence
   // into a conversation the user has already left.
   useEffect(() => {
-    dictation.cancel();
-  }, [daemon.sessionId, dictation.cancel]);
+    cancelDictation();
+  }, [daemon.sessionId, cancelDictation]);
 
   const openAttach = useCallback(() => {
     Keyboard.dismiss();
@@ -795,12 +1170,12 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
    */
   const startNewChat = useCallback(
     (cwd?: string) => {
-      if (cwd && active) daemon.selectProject(active.id, cwd);
-      daemon.leave();
+      if (cwd && activeId) selectDaemonProject(activeId, cwd);
+      leaveDaemon();
       setNewChatOpen(false);
       setMenuOpen(false);
     },
-    [active?.id, daemon.selectProject, daemon.leave],
+    [activeId, selectDaemonProject, leaveDaemon],
   );
   const closeNewChat = useCallback(() => setNewChatOpen(false), []);
   // The drawer only ever offers this beside a named project, so it always has
@@ -810,7 +1185,7 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
   const pickCommand = useCallback((command: SlashCommand) => {
     // Placed in the composer rather than sent: a command may still want an
     // argument, and even one that does not should be reviewed before running.
-    setDraft(applyCommand(command));
+    composer.current?.setDraft(applyCommand(command));
     setCommandsOpen(false);
     // Straight back to typing, caret after the trailing space. Deferred past
     // this commit because the sheet still holds focus during it, and focusing
@@ -835,9 +1210,9 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
     (requestId: string, optionId: string, deny: boolean) => {
       if (deny) haptics.warned();
       else haptics.sent();
-      daemon.answer(requestId, optionId);
+      answerDaemon(requestId, optionId);
     },
-    [daemon.answer],
+    [answerDaemon],
   );
 
   const closePicker = useCallback(() => setPicker(null), []);
@@ -864,7 +1239,7 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
       <Sidebar
         open={menuOpen}
         providers={daemon.providers}
-        sessions={daemon.sessions}
+        sessions={drawerProjection.rows}
         activeProviderId={active?.id}
         activeSessionId={daemon.sessionId}
         // Selecting an app refilters the history in place. The drawer stays
@@ -883,28 +1258,29 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
         machineLabel={pairing.label}
         machineRemote={pairing.remote}
         connectionStatus={daemon.status}
-        onUnpair={onUnpair}
+        update={daemon.update}
+        onOpenConnection={openConnection}
       />
 
       {/* The conversation pane. Slides right to reveal the drawer beneath. */}
-      <Animated.View style={[styles.pane, { transform: [{ translateX: slideX }] }]}>
+      <Reanimated.View style={[styles.pane, paneSlide]}>
       {/* Starts below the nav: this strip is the hit target for anything it
           covers, and over the nav it would swallow taps on the menu button. */}
       {!menuOpen && (
-        <View
-          style={[styles.edgeSwipe, { top: insets.top + navHeight }]}
-          {...edgeSwipe.panHandlers}
-        />
+        <GestureDetector gesture={edgeSwipeClosed}>
+          <View style={[styles.edgeSwipe, { top: insets.top + navHeight }]} />
+        </GestureDetector>
       )}
       {/* Full-bleed on both edges: the thread runs behind the status bar and
-          down to the home indicator, and a ProgressiveBlur covers each of those
-          regions, so content dissolves into frosted chrome at both ends rather
-          than meeting a solid band. The dock carries the bottom inset itself. */}
+          down to the home indicator, and a CanvasCover covers each of those
+          regions, so content fades out into the canvas colour at both ends
+          rather than meeting a solid band. The dock carries the bottom inset
+          itself. */}
       <SafeAreaView style={styles.paneInner} edges={[]}>
 
-      {/* Absolute over the thread: messages scroll beneath the nav and
-          dissolve into the ProgressiveBlur fade instead of hitting a panel
-          edge, so the conversation keeps the full screen height. */}
+      {/* Absolute over the thread: messages scroll beneath the nav and fade
+          out under the CanvasCover instead of hitting a panel edge, so the
+          conversation keeps the full screen height. */}
       <View
         style={[styles.topBar, styles.topBarOverlay, { top: insets.top }]}
         onLayout={(e) => setNavHeight(e.nativeEvent.layout.height)}
@@ -933,58 +1309,17 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
           )}
         </View>
 
-        {/* No agent-name pill. Which app is connected is already the drawer's
-            job, and repeating it here only stole width from the selectors,
-            which are the sole reason the top bar is interactive. */}
-        {model && (
-          <View
-            style={styles.selectorPill}
-            onLayout={(e) => setPillX(withLayoutX(e, "model"))}
-          >
-            <Pill
-              label={`Model: ${valueName(model)}${level ? `, ${valueName(level)}` : ""}`}
-              onPress={() => setPicker("model")}
-            >
-              {/* The thinking level is not shown here. It lives in this pill's
-                  own menu, and squeezing both names into one pill truncated
-                  each to a couple of letters. */}
-              <Text style={styles.selectorValue} numberOfLines={1}>
-                {valueName(model)}
-              </Text>
-              <Ionicons
-                name="chevron-down"
-                size={13}
-                color={theme.color.textDim}
-                style={styles.pillChevron}
-              />
-            </Pill>
-          </View>
-        )}
+        <Text
+          style={styles.sessionTitle}
+          numberOfLines={1}
+          ellipsizeMode="tail"
+          accessibilityRole="header"
+          accessibilityLabel={sessionTitle}
+        >
+          {sessionTitle}
+        </Text>
 
-        {mode && (
-          <View
-            style={styles.selectorPill}
-            onLayout={(e) => setPillX(withLayoutX(e, "mode"))}
-          >
-            <Pill
-              label={`${mode.name}: ${valueName(mode)}`}
-              onPress={() => setPicker("mode")}
-            >
-              <Text style={styles.selectorValue} numberOfLines={1}>
-                {valueName(mode)}
-              </Text>
-              <Ionicons
-                name="chevron-down"
-                size={13}
-                color={theme.color.textDim}
-                style={styles.pillChevron}
-              />
-            </Pill>
-          </View>
-        )}
-
-        <View style={styles.topBarSpacer} />
-
+        <View style={styles.navAction}>
         {inThread && (
           // Asks where, rather than starting one immediately: the old behaviour
           // always landed wherever the agent happened to be, which is the wrong
@@ -993,13 +1328,14 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
             <Ionicons name="create-outline" size={18} color={theme.color.text} />
           </CircleButton>
         )}
+        </View>
       </View>
 
       {/* Frosted cover for the nav zone only — it ends exactly at the nav's
           bottom edge and touches nothing below it. pointerEvents-none, so it
           never swallows a tap on a message or a pill. */}
       {navHeight > 0 && (
-        <ProgressiveBlur
+        <CanvasCover
           // From the very top edge to the nav's bottom edge. No tail.
           height={insets.top + navHeight}
           style={styles.navFade}
@@ -1010,7 +1346,7 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
           single transform, so the gap between them never changes and nothing
           re-lays out on the keyboard's clock. */}
       <Reanimated.View style={[styles.body, keyboard.pane]}>
-        {inThread ? (
+        {inThread || daemon.restoreTarget ? (
           // Remounted per conversation so `startRenderingFromBottom` re-arms:
           // each transcript must open on its own newest message, not on the
           // scroll offset the previous one happened to be left at.
@@ -1018,15 +1354,23 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
             key={threadKey}
             ref={scroller}
             turns={daemon.turns}
+            activeStream={daemon.activeStream}
+            restore={daemon.restoreTarget ? {
+              title: daemon.restoreTarget.title,
+              state: restorePresentation(daemon.restoreTarget, daemon.loadingSession, daemon.restoreError, daemon.turns.length, daemon.status),
+              error: daemon.restoreError,
+              onRetry: () => daemon.openSession(daemon.restoreTarget!.id),
+            } : undefined}
             threadTop={threadTop}
             threadBottom={threadBottom}
-            working={working}
+            working={working && !daemon.loadingSession && !daemon.restoreError}
             activity={daemon.activity}
             receipt={daemon.receipt}
             indicatorTop={insets.top + navHeight}
             indicatorBottom={dockHeight}
             onAtBottomChange={setAtBottom}
             onOpenThought={openThought}
+            onRetry={retrySend}
           />
         ) : !daemon.loadingSession ? (
           // Cancels half the pane's lift, so the greeting settles in the middle
@@ -1052,14 +1396,29 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
                 {/* A refusal the daemon explained outranks the connecting
                     state: reconnecting cannot fix a rotated key or a version
                     mismatch, so "Connecting..." would loop forever while
-                    telling the one person who can act nothing at all. */}
+                    telling the one person who can act nothing at all.
+
+                    Then the quieter version of the same failure. A pairing the
+                    machine rejects below the socket — 401 from the daemon, 409
+                    from a relay room with no machine in it — sends no frame to
+                    explain itself, so retrying continues in the background
+                    while the words stop pretending it is nearly there.
+
+                    Deliberately not a checklist. By far the commonest reason
+                    this shows is that the phone has no signal, and the machine
+                    is fine — so instructions to go and inspect it are wrong
+                    advice most of the times they are read, and unfollowable
+                    anyway from wherever the user is standing. What can be done
+                    from here is keep typing, which the composer now says. */}
                 {daemon.fatal
                   ? daemon.fatal
-                  : daemon.status !== "online"
-                    ? "Connecting to your machine..."
-                    : active
-                      ? greeting
-                      : emptyReason(daemon.providers.length)}
+                  : daemon.unreachable
+                    ? "Can't reach your machine."
+                    : daemon.status !== "online"
+                      ? "Connecting to your machine..."
+                      : active
+                        ? greeting
+                        : emptyReason(daemon.providers.length)}
               </Text>
             </Pressable>
           </Reanimated.View>
@@ -1087,9 +1446,17 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
             </CircleButton>
           </Animated.View>
           {dockHeight > 0 && (
-            <ProgressiveBlur edge="bottom" height={dockHeight} style={styles.dockCover} />
+            <CanvasCover edge="bottom" height={dockHeight} style={styles.dockCover} />
           )}
-          <View
+          {/* The dock keeps the composer even while an approval is pending:
+              the request is its own blocking sheet now, so swapping this out
+              under it would only resize the thread behind a covered surface.
+
+              It owns the draft, so typing re-renders this subtree and not the
+              whole app. That is what leaves the JS thread free for the
+              composer's own growth animation while a line wraps. */}
+          <ComposerDock
+            ref={composer}
             style={[
               styles.dock,
               // Constant. The spacer below the body carries the keyboard, and it
@@ -1097,62 +1464,57 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
               // same gap above either boundary without re-laying out.
               { paddingBottom: insets.bottom + theme.space(2) },
             ]}
-            onLayout={(event) => {
-              // Read out here, not inside the updater. React pools synthetic
-              // events and nulls `nativeEvent` once the handler returns, and a
-              // state updater runs after that — reaching into the event from in
-              // there threw `Cannot read property 'layout' of null` and took the
-              // whole render down.
-              const height = event.nativeEvent.layout.height;
+            // Settled heights only. The dock reports once its growth animation
+            // has stopped, not on every frame of it — measured at roughly one
+            // layout pass per two pixels, which turned a single wrapped line
+            // into about ten re-renders of this whole component, each one
+            // rebuilding the thread's spacers and re-running its follow-scroll
+            // on the exact frames the composer was trying to animate.
+            onHeightSettled={(height) => {
               // Recorded against the state it was measured in, and only when it
-              // actually changed: an unconditional set would re-render on every
-              // layout pass the dock does, including the ones the keyboard's own
-              // animation causes.
+              // actually changed — the keyboard's own animation causes layout
+              // passes that have nothing to do with the draft.
               setDockHeights((prev) => recordDockHeight(prev, typing, height));
             }}
-          >
-          {/* The dock keeps the composer even while an approval is pending:
-              the request is its own blocking sheet now, so swapping this out
-              under it would only resize the thread behind a covered surface.
-
-              The context row shows what the next prompt acts on — project,
-              context fill, uncommitted work, and the commands the agent offers
-              (an empty sheet is worse than no button). Never while typing: the
-              draft is the subject then, and the row would only crowd it. */}
-          {!typing && (daemon.commands.length > 0 || daemon.workspace || daemon.usage) && (
-            <ContextBar
-              workspace={daemon.workspace}
-              usage={daemon.usage}
-              showCommands={daemon.commands.length > 0}
-              onCommands={openCommands}
-            />
-          )}
-          <Composer
-            ref={composer}
-            value={draft}
-            onChangeText={setDraft}
+            typing={typing}
+            workspace={daemon.workspace}
+            usage={daemon.usage}
+            showCommands={daemon.commands.length > 0}
+            onCommands={openCommands}
+            onProjectDetails={openContext}
+            selectors={composerSelectors}
             onSend={send}
             busy={showsStop(daemon)}
             onStop={daemon.cancel}
-            editable={daemon.status === "online"}
+            // Never locked by the network. A dead socket used to disable the
+            // whole composer — no keyboard, no typing, nothing — which is the
+            // one moment a phone is most likely to be in a tunnel and the user
+            // most wants to get a thought down. Offline sends are queued and
+            // delivered on reconnect (see `outbox.ts`), so the only thing that
+            // still locks it is a refusal retrying cannot fix: a rotated key or
+            // a version mismatch, where nothing typed here could ever go.
+            editable={!daemon.fatal}
             placeholder={
               dictation.listening
                 ? "Listening..."
-                : active
-                  ? "Ask me. Task me..."
-                  : "Waiting for an agent..."
+                : daemon.status !== "online"
+                  ? "Offline. Sends when you reconnect"
+                  : active
+                    ? "Build anything..."
+                    : "Waiting for an agent..."
             }
             attachments={attachments}
             onAttach={openAttach}
             onRemoveAttachment={removeAttachment}
             dictation={dictation}
           />
-          </View>
         </View>
       </Reanimated.View>
 
       {/* Outside the lifted pane: a sheet belongs to the screen's bottom edge,
           not to the composer, so it must not ride up with the keyboard. */}
+      <ContextDetailsSheet visible={contextOpen} workspace={daemon.workspace} usage={daemon.usage} onClose={closeContext} />
+      <ConnectionSheet visible={connectionOpen} machineLabel={pairing.label} machineRemote={pairing.remote} status={daemon.status} update={daemon.update} onClose={closeConnection} onUnpair={onUnpair} />
       <CommandSheet
         visible={commandsOpen}
         commands={daemon.commands}
@@ -1180,7 +1542,8 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
       <ConfigPicker
         visible={picker !== null}
         onClose={closePicker}
-        anchorX={picker === "mode" ? pillX.mode : pillX.model}
+        anchorX={pickerAnchor?.x}
+        anchorY={pickerAnchor?.y}
         options={
           picker === "mode"
             ? mode
@@ -1200,24 +1563,26 @@ function Pew2({ pairing, onUnpair }: { pairing: Pairing; onUnpair: () => void })
           anywhere on it closes, which matches the push metaphor better than a
           separate dimming layer would. */}
       {menuOpen && (
-        // The gesture lives on this wrapper, not the Pressable: Pressable spreads
-        // its own responder handlers last and would overwrite them. As the parent
-        // it can still claim the touch from the child once a drag begins.
-        <View style={StyleSheet.absoluteFill} {...edgeSwipe.panHandlers}>
-          <Pressable
-            style={StyleSheet.absoluteFill}
-            accessibilityRole="button"
-            accessibilityLabel="Close menu"
-            onPress={() => {
-              haptics.tap();
-              setMenuOpen(false);
-            }}
-          />
-        </View>
+        // The gesture lives on this wrapper rather than the Pressable, so a drag
+        // and a tap stay two separate things: the detector claims the touch once
+        // it moves horizontally, and the Pressable keeps everything else.
+        <GestureDetector gesture={edgeSwipeOpen}>
+          <View style={StyleSheet.absoluteFill}>
+            <Pressable
+              style={StyleSheet.absoluteFill}
+              accessibilityRole="button"
+              accessibilityLabel="Close menu"
+              onPress={() => {
+                haptics.tap();
+                setMenuOpen(false);
+              }}
+            />
+          </View>
+        </GestureDetector>
       )}
 
       </SafeAreaView>
-      </Animated.View>
+      </Reanimated.View>
     </View>
     </ImageResolverProvider>
   );
@@ -1267,19 +1632,16 @@ const styles = StyleSheet.create({
     zIndex: 3,
   },
   navFade: { zIndex: 2 },
-  topBarSpacer: { flex: 1 },
-  // Pills hug their text, but no single pill may take the row. flexShrink
-  // alone shrinks proportionally, which left the model pill wide and starved
-  // the mode pill to "A…"; the cap bounds the greedy one instead.
-  selectorPill: { flexShrink: 1, minWidth: 0, maxWidth: "42%" },
-  selectorValue: {
-    flexShrink: 1,
+  navAction: { width: theme.size.control, flexShrink: 0 },
+  sessionTitle: {
+    textAlign: "center",
+    flex: 1,
+    minWidth: 0,
     color: theme.color.text,
-    fontSize: theme.font.small,
-    lineHeight: theme.font.body + 4,
+    fontSize: theme.font.body,
+    fontWeight: "600",
   },
-  // Inset so the chevron never hugs the pill edge.
-  pillChevron: { marginLeft: theme.space(0.5) },
+
   statusDot: {
     position: "absolute",
     top: 0,

@@ -16,6 +16,8 @@ import { existsSync } from "node:fs";
 import {
   LABEL,
   buildPlist,
+  isCompiled,
+  programArguments,
   logDir,
   plistPath,
   reloadLaunchdJob,
@@ -192,8 +194,56 @@ test.skipIf(platform() !== "darwin")("the generated plist parses as real XML", a
 
   // plutil is what launchd itself uses; a file it rejects will never load.
   const proc = Bun.spawn(["plutil", "-lint", path], { stdout: "pipe", stderr: "pipe" });
-  const code = await proc.exited;
-  expect(`${path}: ${await new Response(proc.stdout).text()}`.includes("OK")).toBe(true);
-  expect(code).toBe(0);
+
+  // The exit status and both pipes concurrently, rather than awaiting `exited`
+  // first: reading a pipe only after the process is gone depends on its buffer
+  // outliving it, and draining stderr alongside stdout is also what stops a
+  // command that fills one pipe from blocking on the other.
+  const [code, out, err] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+
+  // A clean lint exits 0 and says nothing on stderr. Both are asserted in one
+  // object so a rejected plist shows the reason it gave, instead of reporting
+  // "expected 0, received 1" and discarding the only useful detail.
+  expect({ code, err }).toEqual({ code: 0, err: "" });
+  // `plutil` prints `<path>: OK`, so its own output is the assertion.
+  expect(out).toContain("OK");
   expect(await readFile(path, "utf8")).toContain(LABEL);
+});
+
+test("launchd is given a program that actually exists", () => {
+  // The whole bug, stated as a property. From a checkout this is
+  // `bun run /abs/path/server.ts`; from a compiled binary there is no
+  // server.ts on disk to name, so it has to be the binary and a subcommand.
+  const args = programArguments(bun);
+
+  if (isCompiled()) {
+    expect(args).toEqual([process.execPath, "serve"]);
+  } else {
+    expect(args[0]).toBe(bun);
+    expect(args[1]).toBe("run");
+    expect(existsSync(args[2]!)).toBe(true);
+  }
+
+  // Never the shape that shipped: `pew2 run /$bunfs/server.ts` named a
+  // subcommand that did not exist and a path nothing outside the executable
+  // can open, so launchd started it, pew2 printed its help and exited 1,
+  // KeepAlive restarted it, and the daemon crash-looped for ever.
+  expect(args.join(" ")).not.toContain("$bunfs");
+});
+
+test("the plist runs the program, whatever shape it takes", () => {
+  const plist = buildPlist({ bunPath: bun });
+  const program = programArguments(bun);
+
+  const block = plist.slice(
+    plist.indexOf("<key>ProgramArguments</key>"),
+    plist.indexOf("</array>"),
+  );
+  for (const part of program) expect(block).toContain(`<string>${part}</string>`);
+  // Exactly the arguments, so a stale extra path cannot linger in the array.
+  expect(block.match(/<string>/g)?.length).toBe(program.length);
 });

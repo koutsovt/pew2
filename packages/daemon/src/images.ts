@@ -73,7 +73,17 @@ export function toLocalPath(
     }
   }
   // Any other scheme (http:, data:, mcp:) is not a file on this machine.
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) return undefined;
+  //
+  // A Windows drive letter is not a scheme, though it parses as one. `C:\Users`
+  // matched this, so every absolute Windows path was refused as "not a file on
+  // this machine" and no agent-produced image could load there at all. A scheme
+  // is at least two characters where a drive letter is exactly one — the one
+  // rule that separates them without the code having to know the platform.
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]+:/.test(raw)) return undefined;
+  // A lone letter and colon is a drive only when a separator follows. `x:foo`
+  // is a path relative to that drive's current directory, which is not
+  // something an agent means and would resolve outside the session's cwd.
+  if (/^[a-zA-Z]:/.test(raw) && !/^[a-zA-Z]:[\\/]/.test(raw)) return undefined;
 
   if (raw === "~") return home;
   if (raw.startsWith("~/")) return resolve(home, raw.slice(2));
@@ -112,6 +122,13 @@ export interface ImageBlock {
   data: string;
 }
 
+export type HistoryImage = ImageBlock | {
+  type: "resource_link";
+  uri: string;
+  name: string;
+  mimeType?: string;
+};
+
 /**
  * Pictures inside a message read from an agent's own on-disk history.
  *
@@ -121,9 +138,9 @@ export interface ImageBlock {
  * without this a resumed conversation silently lost every picture it contained
  * while the live stream showed them fine.
  */
-export function historyImages(content: unknown): ImageBlock[] {
+export function historyImages(content: unknown): HistoryImage[] {
   if (!Array.isArray(content)) return [];
-  const images: ImageBlock[] = [];
+  const images: HistoryImage[] = [];
   for (const part of content) {
     if (!part || typeof part !== "object") continue;
 
@@ -148,16 +165,36 @@ export function historyImages(content: unknown): ImageBlock[] {
       continue;
     }
 
+    if (part.type === "resource_link" && typeof part.uri === "string") {
+      images.push({
+        type: "resource_link", uri: part.uri,
+        name: typeof part.name === "string" ? part.name : "Image",
+        ...(typeof part.mimeType === "string" ? { mimeType: part.mimeType } : {}),
+      });
+      continue;
+    }
+
     // OpenAI: { type: "image_url", image_url: { url: "data:image/png;base64,..." } }
     const url = part.image_url?.url ?? part.imageUrl?.url;
     if (typeof url === "string") {
       const match = /^data:([^;,]+);base64,(.+)$/s.exec(url);
-      // Only inline data: a remote URL in stored history is not this daemon's
-      // to fetch, and the app can load it itself.
       if (match) images.push({ type: "image", mimeType: match[1]!, data: match[2]! });
+      // Retain the reference, not a new fetch. The app's existing URI rules and
+      // the daemon's image-file containment checks still apply when it is shown.
+      else if (/^https?:\/\//i.test(url)) {
+        images.push({ type: "resource_link", uri: url, name: "Image" });
+      }
     }
   }
   return images;
+}
+
+/** Only explicit tool-result blocks contribute pictures, never arbitrary tool text. */
+export function historyToolImages(content: unknown): HistoryImage[] {
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((part) =>
+    part?.type === "tool_result" ? historyImages(part.content) : [],
+  );
 }
 
 export interface LoadedImage {

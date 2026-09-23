@@ -1,7 +1,9 @@
-import { createElement, useEffect, useState } from "react";
-import { Ionicons } from "@expo/vector-icons";
+import { createElement, memo, useMemo, useState } from "react";
+import { StreamingMarkdown } from "./StreamingMarkdown";
+import { useSmoothText } from "./useSmoothText";
 import * as Clipboard from "expo-clipboard";
-import { Linking, Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import * as WebBrowser from "expo-web-browser";
+import { Alert, Linking, Platform, StyleSheet, Text, View } from "react-native";
 import Markdown, {
   type MarkdownStyles,
   type RenderFunction,
@@ -10,9 +12,12 @@ import Markdown, {
 import { theme } from "../theme";
 import { ChatImage } from "./ChatImage";
 import { isDisplayableImage } from "../images";
-import { writeCodeToClipboard } from "./codeBlockClipboard";
+import { writeToClipboard } from "./clipboard";
+import { CopyButton } from "./CopyButton";
+import { linkTarget } from "./links";
 import { fencedCodeContainerStyle, fencedCodeTextStyle } from "./markdownCodeStyles";
 import { boundedMarkdownParagraphStyle, boundedMarkdownRootStyle } from "./messageLayoutStyles";
+import { splitMarkdownBlocks } from "./markdownBlocks";
 
 export type MarkdownTone = "body" | "thought" | "system";
 
@@ -25,8 +30,6 @@ function trimTrailingNewline(text: string): string {
   return text.endsWith("\n") ? text.slice(0, -1) : text;
 }
 
-type CopyState = "idle" | "copied" | "failed";
-
 function CodeBlock({
   content,
   containerStyle,
@@ -38,56 +41,14 @@ function CodeBlock({
   contentStyle: object;
   textStyle: object;
 }) {
-  const [copyState, setCopyState] = useState<CopyState>("idle");
-
-  useEffect(() => {
-    if (copyState === "idle") return undefined;
-    const reset = setTimeout(() => setCopyState("idle"), 1800);
-    return () => clearTimeout(reset);
-  }, [copyState]);
-
-  const copyCode = async () => {
-    const copied = await writeCodeToClipboard(content, Clipboard.setStringAsync);
-    setCopyState(copied ? "copied" : "failed");
-  };
-
-  const label =
-    copyState === "copied" ? "Copied" : copyState === "failed" ? "Try again" : "Copy";
-  const icon =
-    copyState === "copied"
-      ? "checkmark"
-      : copyState === "failed"
-        ? "alert-circle-outline"
-        : "copy-outline";
-
   return (
     <View style={containerStyle}>
       <View style={codeBlockChrome.header}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Copy code"
-          accessibilityState={{ selected: copyState === "copied" }}
-          hitSlop={6}
-          onPress={() => void copyCode()}
-          style={({ pressed }) => [
-            codeBlockChrome.copyButton,
-            pressed && codeBlockChrome.copyButtonPressed,
-          ]}
-        >
-          <Ionicons
-            name={icon}
-            size={14}
-            color={copyState === "failed" ? theme.color.danger : theme.color.textDim}
-          />
-          <Text
-            style={[
-              codeBlockChrome.copyLabel,
-              copyState === "failed" && codeBlockChrome.copyLabelFailed,
-            ]}
-          >
-            {label}
-          </Text>
-        </Pressable>
+        {/* The same control the whole reply carries under it. A code block gets
+            its own because a fence is the thing most often wanted on its own —
+            and because holding it selects, but cannot reach past its own
+            scroll. */}
+        <CopyButton text={content} accessibilityLabel="Copy code" />
       </View>
       <View style={contentStyle}>
         <Text selectable style={textStyle}>
@@ -108,17 +69,6 @@ const codeBlockChrome = StyleSheet.create({
     borderBottomColor: theme.color.border,
     backgroundColor: theme.color.surfaceRaised,
   },
-  copyButton: {
-    minHeight: 30,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: theme.space(1),
-    paddingHorizontal: theme.space(2),
-    borderRadius: theme.radius.sm,
-  },
-  copyButtonPressed: { backgroundColor: theme.color.surfacePressed },
-  copyLabel: { color: theme.color.textDim, fontSize: theme.font.tiny, fontWeight: "600" },
-  copyLabelFailed: { color: theme.color.danger },
 });
 
 const renderCodeBlock: RenderFunction = (node, _children, _parents, styles) => {
@@ -158,18 +108,36 @@ const renderImage: RenderFunction = (node) => {
   return <ChatImage key={node.key} image={{ src, alt: alt || undefined }} />;
 };
 
-const markdownRules: Partial<RenderRules> = {
+export const markdownRules: Partial<RenderRules> = {
+  // Every inline run that is *not* a paragraph — a heading, a list item, a table
+  // cell — bottoms out here, and this is the outermost Text of those blocks.
+  //
+  // That is why `selectable` is said twice, here and on the paragraph below.
+  // Nested Text is virtual on both platforms: it is flattened into the one
+  // native text view its top-level Text creates, and the native selection
+  // gesture belongs to that view. So the flag only does anything on the
+  // outermost Text of a block, and there are two kinds of those.
+  textgroup: (node, children, _parents, styles) =>
+    createElement(
+      Text,
+      { ["key"]: node.key, selectable: true, style: styles.text as never },
+      children,
+    ),
   // A paragraph must be one measured Text block. The library's default uses a
   // wrapping row of Text children; inside a list that row reports one-line
   // height while its text paints several lines, so following items overlap it.
   // One exception: a paragraph holding an image becomes a column, because
   // nesting a View in text layout collapses a percentage-width picture on iOS.
+  // Only the Text branch is selectable — a View is not text and `selectable`
+  // means nothing on it.
   paragraph: (node, children, _parents, styles) =>
-    createElement(
-      hasImageChild(node) ? View : Text,
-      { ["key"]: node.key, style: styles.paragraph as never },
-      children,
-    ),
+    hasImageChild(node)
+      ? createElement(View, { ["key"]: node.key, style: styles.paragraph as never }, children)
+      : createElement(
+          Text,
+          { ["key"]: node.key, selectable: true, style: styles.paragraph as never },
+          children,
+        ),
   code_block: renderCodeBlock,
   fence: renderCodeBlock,
   image: renderImage,
@@ -190,7 +158,12 @@ function stylesFor(
   lineHeight: number,
 ): Partial<MarkdownStyles> {
   return {
-    root: { ...boundedMarkdownRootStyle, marginBottom: -BLOCK_GAP },
+    // No negative margin here, unlike the single-render version this replaced.
+    // Each block now carries its own trailing `BLOCK_GAP`, and the cancellation
+    // that keeps a message from ending in dead space belongs once, on the
+    // wrapper around all of them — applied per block it would instead collapse
+    // the gap between every pair of paragraphs.
+    root: boundedMarkdownRootStyle,
     text: { color, fontSize, lineHeight },
     paragraph: {
       color,
@@ -338,19 +311,83 @@ function stylesFor(
 
 // Kept outside render: the markdown renderer memoises its AST renderer by the
 // identity of these objects while streamed chunks update only the source text.
-const markdownStyles: Record<MarkdownTone, Partial<MarkdownStyles>> = {
+export const markdownStyles: Record<MarkdownTone, Partial<MarkdownStyles>> = {
   body: stylesFor(theme.color.text, theme.font.body, theme.line.body),
   thought: stylesFor(theme.color.textDim, theme.font.small, 20),
   system: stylesFor(theme.color.danger, theme.font.small, 20),
 };
 
-function openLink(url: string): void {
-  void Linking.canOpenURL(url)
-    .then((supported) => (supported ? Linking.openURL(url) : undefined))
-    .catch(() => undefined);
+/**
+ * Opening a link from a message.
+ *
+ * A web page opens *inside* the app. Leaving is unusually expensive here: an
+ * agent is running on the other end of this socket, and backgrounding the app
+ * to read a doc page is how a permission request sits unanswered with the
+ * agent stopped, waiting on a phone that is showing Safari. The in-app browser
+ * is one swipe from the conversation and never drops the connection.
+ *
+ * Anything else — `mailto:`, `tel:`, another app's scheme — has no page to
+ * render and goes to the OS, which is the one thing that knows what to do with
+ * it. Whether a scheme is safe to open at all is `links.ts`.
+ *
+ * And a link that cannot be opened now says so. It used to resolve `canOpenURL`
+ * and then quietly drop the URL when the answer was no: the tap did nothing at
+ * all, which reads as the transcript being dead rather than as the link being
+ * unopenable. The alert carries the URL and offers the clipboard, so a link to
+ * an app this phone does not have is still a link the user can use.
+ */
+export function openLink(url: string): void {
+  void (async () => {
+    const target = linkTarget(url);
+    try {
+      if (target === "browser") {
+        await WebBrowser.openBrowserAsync(url, {
+          // The transcript's own surface, so the browser arrives as part of
+          // this app rather than as a white flash out of it.
+          toolbarColor: theme.color.surface,
+          controlsColor: theme.color.accent,
+        });
+        return;
+      }
+      if (target === "external") {
+        await Linking.openURL(url);
+        return;
+      }
+    } catch {
+      // Falls through to the same alert as an unsupported scheme: from the
+      // reader's side, a handler that rejected and a handler that does not
+      // exist are the same event.
+    }
+    Alert.alert("Can't open this link", url, [
+      {
+        text: "Copy link",
+        onPress: () => void writeToClipboard(url, Clipboard.setStringAsync),
+      },
+      { text: "OK", style: "cancel" },
+    ]);
+  })();
 }
 
-export function MarkdownText({ text, tone = "body" }: { text: string; tone?: MarkdownTone }) {
+/**
+ * One top-level block.
+ *
+ * Memoised on its own source text, which is the entire point: while a reply
+ * streams, every block above the one being written is byte-identical from chunk
+ * to chunk, so this bails out before the renderer parses anything. Only the
+ * final block does real work per chunk.
+ */
+const MarkdownBlock = memo(function MarkdownBlock({
+  source,
+  tone,
+  live = false,
+  animate = false,
+}: {
+  source: string;
+  tone: MarkdownTone;
+  live?: boolean;
+  animate?: boolean;
+}) {
+  if (live) return <StreamingMarkdown source={source} animate={animate} rules={markdownRules as RenderRules} style={markdownStyles[tone]} onLinkPress={openLink} />;
   return (
     <Markdown
       rules={markdownRules as RenderRules}
@@ -360,7 +397,70 @@ export function MarkdownText({ text, tone = "body" }: { text: string; tone?: Mar
       // rule, which is replaced above precisely because it cannot load a file
       // that lives on the desktop.
     >
-      {text}
+      {source}
     </Markdown>
   );
+});
+
+function GrowingMarkdownTextView({ text, tone = "body", liveIdentity }: { text: string; tone?: MarkdownTone; liveIdentity?: string }) {
+  const [touchedIdentity, setTouchedIdentity] = useState<string>();
+  const completeBlocks = useMemo(() => splitMarkdownBlocks(text), [text]);
+  // A code-bearing block stays authoritative: never turn half of an inline
+  // code token into fading prose, or pace characters inside a fenced block.
+  const hasCode = /`|^\s*~{3,}/m.test(completeBlocks.at(-1) ?? "");
+  const live = tone === "body" && liveIdentity !== undefined && touchedIdentity !== liveIdentity && !hasCode;
+  const smooth = useSmoothText(text, liveIdentity ?? "history", live);
+  // Splitting is a parse, so it is memoised too — but it is only the block
+  // tokeniser, not the inline pass or the element tree, and it is the one piece
+  // of work that unavoidably sees the whole message.
+  const blocks = useMemo(() => splitMarkdownBlocks(smooth.text), [smooth.text]);
+
+  return (
+    <View style={blockLayout.root} accessibilityLiveRegion="none" onTouchStart={() => { if (liveIdentity) setTouchedIdentity(liveIdentity); }}>
+      {blocks.map((source, index) => (
+        <MarkdownBlock
+          // Index, deliberately. Blocks are an ordered decomposition of one
+          // string: block 2 is always the third thing in this message, and
+          // during streaming it grows in place rather than being reordered or
+          // removed. Keying by content would instead throw away and remount the
+          // block being written on every single chunk — exactly the work this
+          // whole file is arranged to avoid — and would collapse the two
+          // identical paragraphs a message is perfectly entitled to contain.
+          key={index}
+          source={source}
+          tone={tone}
+          live={live && index === blocks.length - 1}
+          animate={live && index === blocks.length - 1 && smooth.animating}
+        />
+      ))}
+    </View>
+  );
 }
+
+const blockLayout = StyleSheet.create({
+  root: {
+    // This wrapper now stands where the single Markdown root used to, so it has
+    // to keep that root's bounding. Without it a long code line has nothing to
+    // shrink against — a View defaults to `flexShrink: 0` — and would push the
+    // message wider than its rail.
+    ...boundedMarkdownRootStyle,
+    // The message ends flush: the last block contributes a trailing `BLOCK_GAP`
+    // like every other, and this takes exactly that back.
+    marginBottom: -BLOCK_GAP,
+  },
+});
+
+/**
+ * Memoised at the message level as well, so a turn that is merely re-rendered
+ * — a sibling streaming, the keyboard opening — does no markdown work at all.
+ */
+function SettledMarkdownText({ text, tone }: { text: string; tone: MarkdownTone }) {
+  const blocks = useMemo(() => splitMarkdownBlocks(text), [text]);
+  return <View style={blockLayout.root}>{blocks.map((source, index) => <MarkdownBlock key={index} source={source} tone={tone} />)}</View>;
+}
+function MarkdownTextView(props: { text: string; tone?: MarkdownTone; liveIdentity?: string }) {
+  return props.liveIdentity && (props.tone ?? "body") === "body"
+    ? <GrowingMarkdownTextView key={props.liveIdentity} {...props} />
+    : <SettledMarkdownText text={props.text} tone={props.tone ?? "body"} />;
+}
+export const MarkdownText = memo(MarkdownTextView);

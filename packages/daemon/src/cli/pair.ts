@@ -22,6 +22,7 @@ import { hostname } from "node:os";
 import { SecureChannel, e2e, wire } from "@pew2/protocol";
 import { daemonPort, daemonUrl } from "./doctor.js";
 import { lanAddresses, loadPairing, pairingUrl, qrCode, rotatePairing } from "../pairing.js";
+import { CLI_DEVICE_PREFIX, isRealClaim } from "../device-claim.js";
 import {
   PALETTE,
   colorLevel,
@@ -178,10 +179,11 @@ export function waitForDevice(options: {
         if (!opened) return;
         const message = opened as { t?: string; deviceId?: string };
         if (message.t !== "device.joined") return;
-        // This socket deliberately never sends `hello`, so it does not announce
-        // itself and should never see its own id here. The guard costs nothing
-        // and means the day that changes, the command does not congratulate the
-        // user on pairing with the machine they are already sitting at.
+        // This socket *does* send `hello` — it has to, or the daemon seals
+        // nothing to it and the join it is waiting for never arrives. So it can
+        // genuinely see itself announced here, and without this guard the
+        // command congratulates the user on pairing with the machine they are
+        // already sitting at, then exits before their phone ever shows up.
         if (message.deviceId === cliDeviceId()) return;
         finish({ deviceId: message.deviceId ?? "a device", elapsedMs: Date.now() - started });
       } catch {
@@ -194,9 +196,20 @@ export function waitForDevice(options: {
   });
 }
 
-/** Stable, obviously-not-a-phone identity for the watching socket. */
+/**
+ * Stable, obviously-not-a-phone identity for the watching socket.
+ *
+ * The prefix is not decoration: `decideClaim` reads it to admit this socket
+ * *without* recording it as the owner. Proving is unavoidable — the daemon seals
+ * broadcasts only to a proved sender, so an unproved watcher never hears the
+ * `device.joined` it exists to wait for — but proving used to make it a device
+ * like any other, and it took the pairing it was printing. The phone that then
+ * scanned the QR was refused as the second device and told to run
+ * `pew2 pair --rotate`, which minted a new code and claimed that one too: the
+ * command whose only job is letting you in was locking you out.
+ */
 export function cliDeviceId(): string {
-  return `pew2-cli@${hostname()}`;
+  return `${CLI_DEVICE_PREFIX}${hostname()}`;
 }
 
 /** Human-facing device name. Ids are opaque; this is the part worth reading. */
@@ -205,6 +218,40 @@ export function deviceLabel(deviceId: string): string {
   if (!trimmed) return "a device";
   // Relay device ids are frequently `<name>-<uuid>`; the uuid is noise here.
   return trimmed.replace(/[-_]?[0-9a-f]{8}-[0-9a-f-]{20,}$/i, "") || trimmed;
+}
+
+/**
+ * Whether printing a code should also re-mint it, and what that supersedes.
+ *
+ * Always, now. Someone typing `pew2 pair` is asking to pair a phone, and the
+ * only code that can serve that is a fresh one — so the command mints one rather
+ * than judging whether they need it.
+ *
+ * This used to reason about the stored claim, and every branch of that reasoning
+ * had a way to strand somebody. A claimed pairing rotated, which was right. An
+ * unclaimed one printed as it stood, to protect a QR being scanned mid-walk —
+ * but the commonest reason a pairing looks unclaimed is that the last attempt
+ * half-failed, and reprinting the code the phone already refused is a loop with
+ * no exit. A pre-gate `phone` placeholder also printed as-is, so anyone on an
+ * older app got the dead code twice. `--rotate` existed to escape all of it,
+ * which is the tell: a flag whose purpose is making the command do the thing
+ * people already meant by running it.
+ *
+ * Rotating every time costs a QR that is being scanned at this exact moment —
+ * rare, caused by running the command twice, and fixed by scanning the new one
+ * already on screen. Not rotating cost people the ability to connect at all.
+ *
+ * `--rotate` is still accepted, so muscle memory and every README line keep
+ * working; it simply no longer decides anything.
+ */
+export function rotationFor(
+  claimedBy: string | undefined,
+  _forced?: boolean,
+): { rotate: boolean; supersededDevice?: string } {
+  // Named only when a real device is being displaced, so the screen can say what
+  // has just stopped working. A pre-gate placeholder is nobody's phone.
+  const claimed = isRealClaim(claimedBy) ? claimedBy : undefined;
+  return { rotate: true, supersededDevice: claimed };
 }
 
 export interface PairOptions {
@@ -220,7 +267,12 @@ export async function cmdPair(flags: Set<string>): Promise<number> {
     wait: !flags.has("--no-wait"),
   };
 
-  const pairing = options.rotate ? await rotatePairing() : await loadPairing();
+  const existing = await loadPairing();
+  const { rotate: rotated, supersededDevice } = rotationFor(
+    existing.claimedBy,
+    Boolean(options.rotate),
+  );
+  const pairing = rotated ? await rotatePairing() : existing;
   const port = daemonPort();
   const addresses = lanAddresses();
   const url = pairingUrl({ token: pairing.token, key: pairing.key, port, relay: pairing.relay });
@@ -249,6 +301,13 @@ export async function cmdPair(flags: Set<string>): Promise<number> {
           daemonRunning,
           remote: reach === "anywhere",
           reach,
+          // Always unclaimed by the time it is printed: a claimed pairing is
+          // re-minted above, so this code can always onboard a phone. Kept
+          // because callers read it, and now it states that plainly.
+          claimedBy: isRealClaim(pairing.claimedBy) ? pairing.claimedBy : null,
+          // The phone this call disconnected, when re-minting took the pairing
+          // from one. An agent driving setup needs to be able to say so.
+          supersededDevice: supersededDevice ?? null,
         },
         null,
         2,
@@ -266,7 +325,12 @@ export async function cmdPair(flags: Set<string>): Promise<number> {
     addresses,
     port,
     daemonRunning,
-    rotated: Boolean(options.rotate),
+    rotated,
+    // Names the phone this replaced, so an unexpected rotation reads as a
+    // consequence of something the user did rather than the tool losing state.
+    // Labelled here: the view renders it as given, and this is the module that
+    // already turns ids into names for the paired line.
+    ...(supersededDevice ? { supersededDevice: deviceLabel(supersededDevice) } : {}),
   };
 
   const style = styler(colorLevel());

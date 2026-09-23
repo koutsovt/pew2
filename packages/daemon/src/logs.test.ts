@@ -7,7 +7,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, open, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { daemonLogPaths, rotateLog } from "./logs.js";
+import { daemonLogPaths, rotateLog, startLogRotation } from "./logs.js";
 
 async function tempLog(contents: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "pew2-logs-"));
@@ -93,14 +93,84 @@ test("an unreadable log never stops the daemon starting", async () => {
   expect(result.rotated).toBe(false);
 });
 
+test("a daemon that never restarts still gets its log trimmed", async () => {
+  // The case the startup pass cannot cover: a launchd service running for weeks
+  // crosses the ceiling long after its one and only rotation.
+  const path = await tempLog("x".repeat(4096) + "\n");
+  const rotated: string[] = [];
+  const stop = startLogRotation({
+    paths: [path],
+    intervalMs: 5,
+    max: 1024,
+    keep: 256,
+    onRotate: (p) => rotated.push(p),
+  });
+  try {
+    await Bun.sleep(60);
+  } finally {
+    stop();
+  }
+
+  expect(rotated).toContain(path);
+  expect((await stat(path)).size).toBeLessThan(4096);
+
+  // Stopping means stopping: a cleared timer must not trim again afterwards.
+  await writeFile(path, "y".repeat(4096) + "\n");
+  await Bun.sleep(30);
+  expect((await stat(path)).size).toBe(4097);
+});
+
+test("periodic rotation survives a log it cannot read", async () => {
+  // Same rule as the startup pass, but the stakes are higher: a throw inside an
+  // interval callback is an unhandled rejection, which kills a running daemon
+  // and every session on it.
+  const dir = await mkdtemp(join(tmpdir(), "pew2-logs-"));
+  const stop = startLogRotation({ paths: [dir], intervalMs: 5, max: 0, keep: 10 });
+  try {
+    await Bun.sleep(40);
+  } finally {
+    stop();
+  }
+});
+
+test("a reporting callback that throws does not take the daemon with it", async () => {
+  // `onRotate` is the caller's code, and the caller is the daemon that holds
+  // every live session. An unhandled rejection out of housekeeping must not be
+  // how they all end.
+  const path = await tempLog("x".repeat(4096) + "\n");
+  let calls = 0;
+  const stop = startLogRotation({
+    paths: [path],
+    intervalMs: 5,
+    max: 1024,
+    keep: 256,
+    onRotate: () => {
+      calls += 1;
+      throw new Error("reporting blew up");
+    },
+  });
+  try {
+    await Bun.sleep(40);
+  } finally {
+    stop();
+  }
+
+  // The throw has to have actually happened, or this proves nothing.
+  expect(calls).toBeGreaterThan(0);
+  // And the work still landed: the rotation runs before the report.
+  expect((await stat(path)).size).toBeLessThan(4096);
+});
+
 test("both streams are rotated, and PEW2_HOME is honoured", () => {
   // stderr is the one that runs away: a provider failing every probe writes a
   // stack trace each time, unwatched.
-  expect(daemonLogPaths({ PEW2_HOME: "/tmp/x" } as NodeJS.ProcessEnv)).toEqual([
-    "/tmp/x/logs/daemon.log",
-    "/tmp/x/logs/daemon.error.log",
+  // Both files, in order, under whatever home was given - asserted with `join`
+  // so it is the same claim on either platform.
+  expect(daemonLogPaths({ PEW2_HOME: join("/tmp", "x") } as NodeJS.ProcessEnv)).toEqual([
+    join("/tmp", "x", "logs", "daemon.log"),
+    join("/tmp", "x", "logs", "daemon.error.log"),
   ]);
-  expect(daemonLogPaths({} as NodeJS.ProcessEnv, "/Users/someone")[0]).toBe(
-    "/Users/someone/.pew2/logs/daemon.log",
+  expect(daemonLogPaths({} as NodeJS.ProcessEnv, join("/Users", "someone"))[0]).toBe(
+    join("/Users", "someone", ".pew2", "logs", "daemon.log"),
   );
 });

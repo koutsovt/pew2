@@ -12,6 +12,7 @@
  * therefore stored against the provider and applied when the session opens.
  */
 import { test, expect } from "bun:test";
+import { existsSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +22,7 @@ import { readConfigPrefs, writeConfigPref } from "./config-prefs.js";
 import { readSessionPrefs, writeSessionPrefs } from "./session-prefs.js";
 import { withStoredPrefs } from "./index.js";
 import type { AcpSessionHandle } from "./acp/connect.js";
+import { storeAttachments } from "./attachments.js";
 
 function daemonWithCollector() {
   const sent: unknown[] = [];
@@ -29,9 +31,33 @@ function daemonWithCollector() {
   return { daemon, sent };
 }
 
+/**
+ * Wait for a message to appear, rather than for a number of milliseconds.
+ *
+ * The announcements under test are fired beside a write instead of being
+ * awaited by their caller — a client learning about a preference must not hold
+ * up the reply to the tap that set it — so "has it happened yet" is the only
+ * honest question, and a fixed sleep is a flake waiting for a slow disk.
+ */
+async function until<T>(read: () => T | undefined, what: string): Promise<T> {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const value = read();
+    if (value !== undefined) return value;
+    await Bun.sleep(1);
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
 /** Register a session without spawning an agent: the mechanism is what matters. */
 function plantSession(daemon: Daemon, sessionId: string) {
-  const session = {
+  const session: {
+    handle: AcpSessionHandle;
+    log: SessionLog;
+    providerId: string;
+    live: boolean;
+    working?: boolean;
+    permissions?: Map<string, unknown>;
+  } = {
     handle: {} as AcpSessionHandle,
     log: new SessionLog(sessionId),
     providerId: "test",
@@ -294,9 +320,118 @@ test("resume history streams after announcement and ends with a completion frame
   });
 });
 
-test("a probe reports the remembered value, not the agent's default", () => {
+test("a reconnecting client is given every event it missed while offline", () => {
+  // The bug this guards: a phone loses its socket constantly — screen lock, app
+  // suspend, wifi to cellular — and a frame sent while it is down is gone for
+  // good (the relay stores nothing, and `RelayClient.send` drops it). The agent
+  // keeps working through all of that, so the phone came back and resumed at
+  // the live edge: twenty seconds of tool calls simply never appeared, and the
+  // first thing the user saw was a shell command from the middle of the work.
+  const { daemon, sent } = daemonWithCollector();
+  const session = plantSession(daemon, "live");
+  daemon.markLive("live");
+  sent.length = 0;
+
+  // Three events the client saw, then two it did not.
+  for (const n of [0, 1, 2, 3, 4]) (daemon as any).record(session, { n });
+  session.working = true;
+
+  const frames = daemon.catchUp({ live: 2 });
+
+  expect(frames).toHaveLength(1);
+  expect(frames[0]).toMatchObject({
+    t: "session.replay",
+    sessionId: "live",
+    complete: true,
+    catchUp: true,
+    working: true,
+  });
+  expect(frames[0]!.events.map((event: any) => event.payload.n)).toEqual([3, 4]);
+});
+
+test("a catch-up reports a turn that ended while the client was away", () => {
+  // `session.idle` is broadcast, not logged, so a finished turn replays no
+  // event saying it finished. Without the flag the phone would catch up on the
+  // last chunk of a turn and then spin on it for ever.
+  const { daemon } = daemonWithCollector();
+  const session = plantSession(daemon, "done");
+  daemon.markLive("done");
+  (daemon as any).record(session, { n: 0 });
+  session.working = false;
+
+  expect(daemon.catchUp({ done: -1 })[0]).toMatchObject({ working: false });
+  // Still answered when nothing was missed and nothing is running. The frame
+  // costs a few bytes and carries the two facts a returning client cannot infer
+  // for itself: the turn is over, and no approval is waiting.
+  expect(daemon.catchUp({ done: 0 })[0]).toMatchObject({
+    events: [],
+    working: false,
+    permissions: [],
+  });
+});
+
+test("a catch-up re-states an approval the agent is still blocked on", () => {
+  // The failure this closes: the phone loses signal, the agent asks to run a
+  // command, and the request event is replayed but deliberately ignored as
+  // history — so the sheet never came back, and since neither ACP nor this
+  // daemon times a permission out, the turn stopped for good. Only the daemon
+  // knows which requests are still open; the resolver lives with the
+  // connection.
+  const { daemon } = daemonWithCollector();
+  const session = plantSession(daemon, "blocked");
+  daemon.markLive("blocked");
+  session.working = true;
+  session.permissions = new Map([["perm_1", { toolCall: { title: "Run tests" } }]]);
+  (daemon as any).record(session, { kind: "permission_request", requestId: "perm_1" });
+
+  // Even with nothing missed: the client saw the request go by and then lost
+  // the socket before the user could answer it.
+  expect(daemon.catchUp({ blocked: 0 })[0]).toMatchObject({
+    permissions: [{ requestId: "perm_1", params: { toolCall: { title: "Run tests" } } }],
+  });
+
+  // Answered, so no longer something to come back to — and reported as an empty
+  // array rather than an absent field. The app reads absent as "an older daemon
+  // said nothing, leave the sheet alone" and empty as "dismiss it", so this is
+  // the frame that clears a sheet the user answered at the desk while the phone
+  // was offline.
+  session.handle = { answerPermission: () => true } as unknown as AcpSessionHandle;
+  daemon.answerPermission("blocked", "perm_1", "allow");
+  expect(session.permissions.size).toBe(0);
+  expect((daemon.catchUp({ blocked: 0 })[0] as any)?.permissions).toEqual([]);
+});
+
+test("an answer the connection does not recognise leaves other requests pending", () => {
+  // `answerPermission` returns false when the request is already resolved — a
+  // stale sheet, or a second client answering first. Forgetting it on that
+  // basis would drop a *different* request that is genuinely still open, which
+  // is the same hang from the other direction.
+  const { daemon } = daemonWithCollector();
+  const session = plantSession(daemon, "stale");
+  session.handle = { answerPermission: () => false } as unknown as AcpSessionHandle;
+  session.permissions = new Map([["perm_2", {}]]);
+
+  expect(daemon.answerPermission("stale", "perm_1", "allow")).toBe(false);
+  expect([...session.permissions.keys()]).toEqual(["perm_2"]);
+});
+
+test("a catch-up never invents a session the client was not introduced to", () => {
+  // Clients drop events for sessions they have never been told about, and a
+  // session that is not live has had no `session.started`. Replaying into one
+  // would break the very invariant `markLive` exists to hold.
+  const { daemon } = daemonWithCollector();
+  const session = plantSession(daemon, "hidden");
+  (daemon as any).record(session, { n: 0 });
+  session.working = true;
+
+  expect(daemon.catchUp({ hidden: -1 })).toEqual([]);
+  expect(daemon.catchUp({ "never-existed": -1 })).toEqual([]);
+});
+
+test("a capability answer carries the remembered value, not the agent's default", () => {
   // The pills read this before any session exists. Reporting the agent's own
-  // default here is what showed "Default" until the first prompt landed.
+  // default showed "Default" until the first prompt landed. Folded in per
+  // answer rather than into the probe — see the test below for why.
   const options = [
     {
       id: "__acp_model",
@@ -326,6 +461,99 @@ test("a preference the agent no longer offers is ignored", () => {
   ];
 
   expect(withStoredPrefs(options, { __acp_model: "gone" })[0]?.currentValue).toBe("sonnet");
+});
+
+test("a model chosen in a conversation moves what the next one will open with", async () => {
+  // The dangerous version of this bug: the pill said "Opus", the prompt ran on
+  // the remembered model, and nothing on screen ever admitted the difference.
+  // A choice made inside a conversation is recorded against the provider too, so
+  // every client's empty state has to be told — that announcement is the only
+  // thing that can describe what the next prompt will actually use.
+  const { daemon, sent } = daemonWithCollector();
+  const session: any = plantSession(daemon, "live-model");
+  const opus = [
+    {
+      id: "__acp_model",
+      name: "Model",
+      type: "select",
+      currentValue: "opus",
+      options: [
+        { value: "sonnet", name: "Sonnet" },
+        { value: "opus", name: "Opus" },
+      ],
+    },
+  ];
+  session.handle = {
+    configOptions: opus,
+    setConfigOption: async () => opus,
+  } as unknown as AcpSessionHandle;
+
+  const home = process.env.PEW2_HOME;
+  process.env.PEW2_HOME = await mkdtemp(join(tmpdir(), "pew2-provider-config-"));
+  try {
+    await daemon.setConfigOption("live-model", "__acp_model", "opus");
+
+    const announced: any = await until(
+      () => sent.findLast((m: any) => m.t === "provider.config"),
+      "the provider-level announcement",
+    );
+    expect(announced.providerId).toBe("test");
+    expect(announced.configOptions[0].currentValue).toBe("opus");
+  } finally {
+    if (home === undefined) delete process.env.PEW2_HOME;
+    else process.env.PEW2_HOME = home;
+  }
+});
+
+test("capabilities are answered at the values in force now, not the ones probed", async () => {
+  // A probe outlives the ask that created it, so a preference folded into it
+  // once is reported for as long as it is cached: pick a model, and the empty
+  // state goes on naming whichever one was current when the agent was asked.
+  // Planting the probe directly is what pins that — the staleness refresh this
+  // daemon would otherwise run finds no provider named "test" and changes
+  // nothing, which is exactly the state under test here.
+  const { daemon, sent } = daemonWithCollector();
+  (daemon as any).probes.set(
+    "test",
+    Promise.resolve({
+      configOptions: [
+        {
+          id: "__acp_model",
+          name: "Model",
+          type: "select",
+          currentValue: "sonnet",
+          options: [
+            { value: "sonnet", name: "Sonnet" },
+            { value: "opus", name: "Opus" },
+          ],
+        },
+      ],
+      sessions: [],
+      canResume: false,
+    }),
+  );
+
+  const home = process.env.PEW2_HOME;
+  process.env.PEW2_HOME = await mkdtemp(join(tmpdir(), "pew2-capabilities-prefs-"));
+  try {
+    const first = await daemon.capabilitiesFor("test");
+    expect(first.configOptions[0]?.currentValue).toBe("sonnet");
+
+    await daemon.rememberConfigOption("test", "__acp_model", "opus");
+    // The same choice made from the empty state, which has no session to set it
+    // on: awaited here both to cover that announcement and so the write is
+    // certainly on disk before the second read below.
+    const announced: any = await until(
+      () => sent.findLast((m: any) => m.t === "provider.config"),
+      "the announcement that a provider-level choice changed",
+    );
+    expect(announced.configOptions[0].currentValue).toBe("opus");
+
+    expect((await daemon.capabilitiesFor("test")).configOptions[0]?.currentValue).toBe("opus");
+  } finally {
+    if (home === undefined) delete process.env.PEW2_HOME;
+    else process.env.PEW2_HOME = home;
+  }
 });
 
 test("a selector the agent changes by itself reaches the app", async () => {
@@ -517,6 +745,69 @@ test("a turn still running is never reaped, however quiet it has gone", () => {
   expect(working.wasClosed()).toBe(false);
 });
 
+test("a session stuck on an unanswered permission is released after an hour", () => {
+  // `working` is true for the whole wait, so this session was invisible to the
+  // reaper: a request nobody ever saw pinned a whole agent, and one of the four
+  // live slots, for as long as the daemon ran. Closing is not answering — the
+  // conversation resumes when it is reopened.
+  const { daemon } = daemonWithCollector();
+  const stuck = plantIdleSession(daemon, "stuck", {
+    working: true,
+    permissions: new Map([["perm_1", {}]]),
+  });
+
+  expect(daemon.reapIdleSessions(2 * 60 * 60 * 1000)).toEqual(["stuck"]);
+  expect(stuck.wasClosed()).toBe(true);
+});
+
+test("a permission asked minutes ago is still the user's to answer", () => {
+  // The whole reason nothing times a permission out: a phone that lost signal
+  // mid-request comes back and answers. Only an hour of silence is evidence
+  // that nobody is coming.
+  const { daemon } = daemonWithCollector();
+  const asked = plantIdleSession(daemon, "asked", {
+    working: true,
+    permissions: new Map([["perm_1", {}]]),
+    lastUsedAt: 60 * 60 * 1000,
+  });
+
+  // Twenty minutes later: well past the idle TTL, nowhere near the blocked one.
+  expect(daemon.reapIdleSessions(60 * 60 * 1000 + 20 * 60 * 1000)).toEqual([]);
+  expect(asked.wasClosed()).toBe(false);
+});
+
+test("a long turn with nothing pending is not reaped by the blocked clock", () => {
+  // The gate is a pending permission, not elapsed time on a turn. An agent that
+  // has been grinding for two hours is doing exactly what it was asked to.
+  const { daemon } = daemonWithCollector();
+  const grinding = plantIdleSession(daemon, "grinding", {
+    working: true,
+    permissions: new Map(),
+  });
+
+  expect(daemon.reapIdleSessions(5 * 60 * 60 * 1000)).toEqual([]);
+  expect(grinding.wasClosed()).toBe(false);
+});
+
+test("a reaped session's attachments go with it", async () => {
+  // Attachment files used to be discarded only on shutdown, so every photo sent
+  // to a conversation that was later reaped stayed in the tempdir for the
+  // daemon's lifetime. Every close path runs through `closeSession` now.
+  const { daemon } = daemonWithCollector();
+  const { session } = plantIdleSession(daemon, "withfiles");
+  const [stored] = await storeAttachments(session.log.sessionId, [
+    { name: "shot.png", mimeType: "image/png", data: btoa("png bytes") },
+  ]);
+  expect(existsSync(stored!.path)).toBe(true);
+
+  daemon.reapIdleSessions(2 * 60 * 60 * 1000);
+  // `discardAttachments` is fire-and-forget by design — a close must not wait on
+  // a disk — so this waits for the unlink rather than assuming it has landed.
+  await until(() => (existsSync(stored!.path) ? undefined : true), "attachments removed");
+
+  expect(existsSync(stored!.path)).toBe(false);
+});
+
 test("a conversation used recently is left alone", () => {
   const { daemon } = daemonWithCollector();
   const fresh = plantIdleSession(daemon, "fresh", { lastUsedAt: 60 * 60 * 1000 });
@@ -648,4 +939,47 @@ test("the idle window is fifteen minutes, not an afternoon", () => {
   expect(daemon.reapIdleSessions(14 * 60 * 1000)).toEqual([]);
   // A minute past it: gone.
   expect(daemon.reapIdleSessions(16 * 60 * 1000)).toEqual(["just-inside"]);
+});
+
+test("a daemon with nothing in flight is quiet", () => {
+  // The precondition for exiting to pick up a new binary. An open conversation
+  // is not busy: the transcript is on disk and reopening resumes it.
+  const { daemon } = daemonWithCollector();
+  plantIdleSession(daemon, "open");
+
+  expect(daemon.busyReason()).toBeUndefined();
+});
+
+test("a session mid-turn makes the daemon busy", () => {
+  // Ending the process here abandons a turn that cannot be resumed from the
+  // middle, however silent the agent has gone.
+  const { daemon } = daemonWithCollector();
+  plantIdleSession(daemon, "turning", { working: true });
+
+  expect(daemon.busyReason()).toContain("turning");
+  expect(daemon.busyReason()).toContain("mid-turn");
+});
+
+test("an unanswered permission makes the daemon busy", () => {
+  // The question is already on someone's screen; exiting makes their next tap
+  // do nothing at all.
+  const { daemon } = daemonWithCollector();
+  plantIdleSession(daemon, "asking", { permissions: new Map([["perm_1", {}]]) });
+
+  expect(daemon.busyReason()).toContain("approval");
+});
+
+test("a session still opening makes the daemon busy", () => {
+  // Its agent has been spawned and is not yet usable, so ending now leaks the
+  // process rather than closing it.
+  const { daemon } = daemonWithCollector();
+  plantIdleSession(daemon, "starting", { agentSessionId: undefined });
+
+  expect(daemon.busyReason()).toContain("still opening");
+});
+
+test("an empty daemon is quiet", () => {
+  const { daemon } = daemonWithCollector();
+
+  expect(daemon.busyReason()).toBeUndefined();
 });

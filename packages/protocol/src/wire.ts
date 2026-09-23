@@ -26,6 +26,25 @@ import { z } from "zod";
 export const WIRE_VERSION = 2;
 
 /**
+ * The per-session cursors off a cleartext `hello`, ignoring anything malformed.
+ *
+ * A `hello` is read before the channel exists, so it is never schema-validated
+ * as a whole: whatever the socket sent is a plain `unknown`. Both transports
+ * answer these cursors with a catch-up replay, and both must reject junk the
+ * same way — a negative or fractional seq here would make `since()` slice from
+ * the wrong end and re-send a whole session.
+ */
+export function readCursors(value: unknown): Record<string, number> {
+  if (typeof value !== "object" || value === null) return {};
+  const cursors: Record<string, number> = {};
+  for (const [sessionId, seq] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof seq !== "number" || !Number.isInteger(seq) || seq < 0) continue;
+    cursors[sessionId] = seq;
+  }
+  return cursors;
+}
+
+/**
  * Whether a peer speaking `wire` can be talked to, and what to tell the user.
  *
  * Returns a sentence rather than a boolean so both sides say the same thing, and
@@ -121,6 +140,34 @@ export const ProviderAnnounce = z.object({
    * `agentSessionId`.
    */
   activeSessions: z.array(z.string()).default([]),
+  /**
+   * A newer pew2 has been published and this machine is not running it yet.
+   *
+   * Absent is the normal state, and deliberately means two different things:
+   * either there is nothing newer, or this daemon predates the field. Both are
+   * "say nothing", which is why it is optional rather than a nullable object —
+   * an older daemon must never make the app claim it is up to date.
+   *
+   * Only sent while that version is *not installed*. A daemon that can update
+   * itself does so within hours and this disappears on its own; one that cannot
+   * — no service registered, an unwritable install directory, a download that
+   * keeps failing — keeps saying so, because then a human has to re-run the
+   * install line. That is the whole reason this reaches the phone: the daemon
+   * has no screen of its own, and the person who can act is looking at this one.
+   */
+  update: z
+    .object({
+      /** The published version, e.g. "0.9.19". */
+      latest: z.string(),
+      /**
+       * Whether the daemon expects to install it without being asked.
+       *
+       * False is the actionable case, and it is what turns the notice from a
+       * status line into an instruction.
+       */
+      automatic: z.boolean(),
+    })
+    .optional(),
 });
 
 /**
@@ -267,6 +314,26 @@ export const SetProviderConfig = z.object({
   value: z.union([z.string(), z.boolean()]),
 });
 
+/**
+ * Daemon -> app. What a *new* session on this provider will open with.
+ *
+ * The same `t` in the other direction, exactly as `session.config` already
+ * works: the app names a choice, the daemon answers with the resulting set.
+ *
+ * Broadcast rather than replied to, and sent for a change made anywhere —
+ * including one made inside a live conversation, which the daemon also records
+ * against the provider. Without it the empty state kept showing whichever
+ * selectors the last conversation happened to hold, while the next prompt
+ * opened at the remembered ones: a pill naming a model that was not the model
+ * about to run. Two devices make that worse, since a choice at the desk moves
+ * what the phone's next prompt will use.
+ */
+export const ProviderConfig = z.object({
+  t: z.literal("provider.config"),
+  providerId: z.string(),
+  configOptions: z.array(ConfigOption),
+});
+
 /** App -> daemon. Reopen one of the agent's own past conversations. */
 export const ResumeSession = z.object({
   t: z.literal("session.resume"),
@@ -326,9 +393,15 @@ export const StartSession = z.object({
    * Echoed back on `session.started`, so a client can tell the session it asked
    * for from one another device started.
    *
-   * Optional because the app does not send one: it adopts the next session for
-   * the provider it is showing. Required here, this schema would reject every
-   * real `session.start` the moment the daemon began validating against it.
+   * `session.started` is broadcast to every paired client, and without this
+   * none of them could tell which request a given one answered. Each assumed it
+   * was its own: starting a conversation anywhere redirected every other device
+   * to it, and — because the frame carries no transcript — redirected them to a
+   * blank one.
+   *
+   * Optional because a client need not send one, and because requiring it would
+   * reject every `session.start` from a client older than this field the moment
+   * the daemon began validating against this schema.
    */
   requestId: z.string().optional(),
   providerId: z.string(),
@@ -495,6 +568,43 @@ export const Replay = z.object({
   events: z.array(SessionEvent),
   /** False for a progressive resume batch; omitted/true marks replay complete. */
   complete: z.boolean().optional(),
+  /**
+   * This batch is a reconnect catch-up, not history.
+   *
+   * The two arrive in the same frame but mean opposite things. A resume replay
+   * is a transcript of work that finished long ago, so it must not light up the
+   * activity line. A catch-up is the last few seconds of a turn that is *still
+   * running* — the tool calls in it are what the agent is doing right now, and
+   * dropping them is why a phone that lost its socket mid-turn showed nothing
+   * until the agent happened to start another tool.
+   */
+  catchUp: z.boolean().optional(),
+  /**
+   * Whether a turn is still in flight, on a catch-up frame.
+   *
+   * `session.idle` is broadcast, not logged, so a turn that ended while the
+   * client was away leaves no event to replay. Without this the app would stay
+   * busy forever after catching up on a finished turn.
+   */
+  working: z.boolean().optional(),
+  /**
+   * Approval requests this session is still blocked on, on a catch-up frame.
+   *
+   * The one piece of a turn that a replayed event stream cannot carry. A
+   * permission request *is* in the log, but the app deliberately ignores it
+   * there: in a resumed transcript it was answered long ago, and raising it
+   * again is a phantom approve sheet over finished history. So a phone that
+   * dropped its signal at the wrong moment came back to a spinner, with the
+   * agent on the desktop waiting on an answer nobody could give — no timeout on
+   * either side, so the turn simply stopped.
+   *
+   * This is the daemon saying which requests are open *right now*, which only
+   * it can know: the resolver lives with the ACP connection. Same shape as the
+   * logged event's payload, so both paths render through one reader.
+   */
+  permissions: z
+    .array(z.object({ requestId: z.string(), params: z.unknown() }))
+    .optional(),
 });
 
 /**
@@ -513,6 +623,47 @@ export const SessionIdle = z.object({
   providerId: z.string().optional(),
   /** Last segment of the session's cwd: the project as people say it. */
   folder: z.string().optional(),
+});
+
+/**
+ * App -> daemon. Where to push when this phone is not listening.
+ *
+ * The local banner can only fire while the app's JavaScript is running, and iOS
+ * suspends that within seconds of the app leaving the screen — so the one case
+ * notifications exist for, a long turn landing while the phone is in a pocket,
+ * is the exact case it could not cover. The turn was announced minutes late, on
+ * reopening, when the socket came back and `session.idle` finally arrived.
+ *
+ * A remote push has to come from something still awake, which is the daemon.
+ * This is how it learns where to send one.
+ *
+ * Travels sealed like every other post-handshake frame, so the relay never sees
+ * the token. The relay is otherwise not involved: the desktop has internet and
+ * calls the push service itself, which keeps the relay a dumb pipe that stores
+ * nothing.
+ *
+ * Sent on every connect, because push tokens rotate.
+ *
+ * Deliberately not a `WIRE_VERSION` bump. A new message type is additive: a
+ * daemon that predates it answers `unknown_message`, which the app treats as a
+ * refusal and falls back to its local-only banners — exactly the behaviour it
+ * had before. Bumping would instead refuse the connection outright and take
+ * working sessions down to deliver a notification improvement.
+ *
+ * The daemon says nothing on success. Silence is acceptance; only a refusal is
+ * spoken, so the app must not assume a token it holds is a token the daemon
+ * kept.
+ */
+export const PushRegister = z.object({
+  t: z.literal("app.push"),
+  /**
+   * An Expo push token (`ExponentPushToken[...]`).
+   *
+   * Not a bare APNs/FCM token: sending to those needs signing credentials, which
+   * live in EAS and must not ship inside a daemon anyone can read the source of.
+   */
+  token: z.string().min(1),
+  platform: z.enum(["ios", "android"]),
 });
 
 /**
@@ -539,11 +690,10 @@ export const ErrorMessage = z.object({
 /**
  * A sealed message. Everything with user content travels as one of these.
  *
- * `sid` and `seq` are readable on purpose, and only because the relay keeps the
- * ordered log that lets a reconnecting phone catch up — the daemon does not
- * replay. They are bound into the AEAD as associated data, so the relay may
- * *read* them to order its log but cannot alter them without every recipient
- * rejecting the frame.
+ * `sid` and `seq` are cleartext headers bound into the AEAD as associated data,
+ * so changing either invalidates the frame. The relay neither stores nor replays
+ * session events. The daemon owns the ordered session log and answers a
+ * reconnecting phone's cursors itself.
  *
  * The definitive shape lives in `crypto.ts`, which is what actually seals and
  * opens these; this mirror exists so a message can be validated on arrival
@@ -576,6 +726,7 @@ export const ClientMessage = z.discriminatedUnion("t", [
   ImageRequest,
   WorkspaceRequest,
   WorkspacesRequest,
+  PushRegister,
 ]);
 
 export const ServerMessage = z.discriminatedUnion("t", [
@@ -583,6 +734,7 @@ export const ServerMessage = z.discriminatedUnion("t", [
   Envelope,
   ProviderAnnounce,
   ProviderCapabilities,
+  ProviderConfig,
   ProviderSessions,
   SessionEvent,
   SessionIdle,
@@ -604,6 +756,7 @@ export type AgentSession = z.output<typeof AgentSession>;
 export type ResumeSession = z.output<typeof ResumeSession>;
 export type ProviderCapabilitiesRequest = z.output<typeof ProviderCapabilitiesRequest>;
 export type ProviderCapabilities = z.output<typeof ProviderCapabilities>;
+export type ProviderConfig = z.output<typeof ProviderConfig>;
 export type AgentProject = z.output<typeof AgentProject>;
 export type ProviderSessionsRequest = z.output<typeof ProviderSessionsRequest>;
 export type ProviderSessions = z.output<typeof ProviderSessions>;
@@ -617,7 +770,9 @@ export type ImageData = z.output<typeof ImageData>;
 export type WorkspaceRequest = z.output<typeof WorkspaceRequest>;
 export type Workspace = z.output<typeof Workspace>;
 export type SessionEvent = z.output<typeof SessionEvent>;
+export type Replay = z.output<typeof Replay>;
 export type SessionIdle = z.output<typeof SessionIdle>;
+export type PushRegister = z.output<typeof PushRegister>;
 export type DeviceJoined = z.output<typeof DeviceJoined>;
 export type WorkspaceEntry = z.output<typeof WorkspaceEntry>;
 export type Workspaces = z.output<typeof Workspaces>;

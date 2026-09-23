@@ -11,8 +11,11 @@
  * horizontally, and a swipe would fight it.
  */
 import { memo } from "react";
-import { Image, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
+import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+// expo-image: these thumbnails decode while the user is typing, and a
+// main-thread decode there lands on the composer's own animation.
+import { Image } from "expo-image";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import { theme } from "../theme";
 import { touchSlop } from "./controls";
 import { haptics } from "./haptics";
@@ -44,7 +47,14 @@ function AttachmentChipsView({ attachments, onRemove }: AttachmentChipsProps) {
       {attachments.map((file) => (
         <View key={file.id} style={styles.chip}>
           {isImageAttachment(file) && file.localUri ? (
-            <Image source={{ uri: file.localUri }} style={styles.thumb} accessible={false} />
+            <Image
+              source={{ uri: file.localUri }}
+              style={styles.thumb}
+              accessible={false}
+              // A chip is a small square crop of a photo that is usually neither.
+              contentFit="cover"
+              transition={0}
+            />
           ) : (
             <View style={styles.glyph}>
               <Ionicons name={glyphFor(file.mimeType)} size={16} color={theme.color.glyph} />

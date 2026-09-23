@@ -10,18 +10,12 @@
  * A real `Modal`, unlike `ConfigPicker`: this *is* leaving the conversation for
  * a moment, and the keyboard should drop.
  */
-import { useCallback, useEffect, useState } from "react";
-import {
-  ActivityIndicator,
-  Image,
-  Modal,
-  Pressable,
-  StyleSheet,
-  Text,
-  View,
-} from "react-native";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ActivityIndicator, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+// Share expo-image's original source cache with the transcript.
+import { Image } from "expo-image";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { Ionicons } from "@expo/vector-icons";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import { theme } from "../theme";
 import { haptics } from "./haptics";
 import { saveImageToDevice, shareImage, type SaveResult } from "./imageSaver";
@@ -118,18 +112,7 @@ export function ImageViewer({
           </Pressable>
         </View>
 
-        {/* Not interactive: taps fall through to the dismiss layer behind it,
-            so tapping anywhere but the buttons closes the viewer. */}
-        <View style={styles.image} pointerEvents="none">
-          <Image
-            accessible
-            accessibilityRole="image"
-            accessibilityLabel={image.alt || "Image from the agent"}
-            source={{ uri: resolvedSrc }}
-            resizeMode="contain"
-            style={styles.imageFill}
-          />
-        </View>
+        <ViewerImage key={resolvedSrc} uri={resolvedSrc} alt={image.alt || "Image from the agent"} />
 
         <View style={[styles.actions, { paddingBottom: insets.bottom + theme.space(4) }]}>
           {!!feedback && (
@@ -186,6 +169,73 @@ export function ImageViewer({
         </View>
       </View>
     </Modal>
+  );
+}
+
+/** iOS supplies native pinch/pan; a tap is a single-pointer zoom alternative. */
+function ViewerImage({ uri, alt }: { uri: string; alt: string }) {
+  const scroll = useRef<ScrollView>(null);
+  const [size, setSize] = useState({ width: 0, height: 0 });
+  const [zoomed, setZoomed] = useState(false);
+  const canZoom = Platform.OS === "ios";
+  const toggleZoom = () => {
+    const scale = zoomed ? 1 : 3;
+    scroll.current?.scrollResponderZoomTo({
+      x: size.width * (1 - 1 / scale) / 2,
+      y: size.height * (1 - 1 / scale) / 2,
+      width: size.width / scale,
+      height: size.height / scale,
+      animated: false,
+    });
+  };
+  const picture = (
+    <Image
+      accessible={!canZoom}
+      accessibilityRole="image"
+      accessibilityLabel={alt}
+      source={{ uri }}
+      contentFit="contain"
+      // Native fit-size resampling is sharper than GPU minification on iOS.
+      // Once magnified, keep original pixels, not an enlarged fit-size bitmap.
+      allowDownscaling={!zoomed}
+      cachePolicy={uri.startsWith("data:") ? "memory" : "memory-disk"}
+      transition={0}
+      style={styles.imageFill}
+    />
+  );
+  if (!canZoom) return <View style={styles.image} pointerEvents="none">{picture}</View>;
+  return (
+    <View style={styles.image} onLayout={({ nativeEvent: { layout } }) => {
+      setSize({ width: layout.width, height: layout.height });
+      setZoomed(false);
+    }}>
+      {size.width > 0 && size.height > 0 && (
+        <ScrollView
+          key={`${size.width}:${size.height}`}
+          ref={scroll}
+          style={styles.image}
+          contentContainerStyle={size}
+          minimumZoomScale={1}
+          maximumZoomScale={8}
+          bouncesZoom={false}
+          showsHorizontalScrollIndicator={false}
+          showsVerticalScrollIndicator={false}
+          contentInsetAdjustmentBehavior="never"
+          onScroll={event => setZoomed(event.nativeEvent.zoomScale > 1)}
+          scrollEventThrottle={16}
+        >
+          <Pressable
+            style={styles.imageFill}
+            accessibilityRole="button"
+            accessibilityLabel={`${alt}. ${zoomed ? "Reset zoom" : "Zoom in"}`}
+            accessibilityHint="Pinch to zoom and drag to move around the image"
+            onPress={toggleZoom}
+          >
+            {picture}
+          </Pressable>
+        </ScrollView>
+      )}
+    </View>
   );
 }
 

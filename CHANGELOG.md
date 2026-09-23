@@ -11,7 +11,110 @@ installs them separately, and what an app and a daemon must agree on is
 
 Dates are the day the tag was cut.
 
-## Unreleased
+## 0.9.14 — 2026-08-08
+
+### Fixed
+
+- **The model pill always names the model that will answer.** Reopening an old
+  conversation and then starting a new one showed the old one's model, while the
+  prompt actually ran on the one you last chose — and the pill only corrected
+  itself after you had sent something. A new conversation opens with your
+  remembered choice; a reopened one comes back with whatever it was last used
+  with. Those are two different answers, and the pill was showing whichever had
+  arrived most recently.
+
+  It now shows nothing at all for the moment while a conversation is still
+  loading, rather than guessing. Changing a model in one conversation also
+  updates what the next one will open with, on every device you have paired.
+
+- Cold launch, streaming and idle battery cost are all down. Long replies
+  re-parsed the entire message on every chunk that arrived, blurred surfaces were
+  rebuilt rather than reused, and animations kept running while the app was in
+  the background.
+- The model dropdown could open transparent on its first use, and looked right
+  the next time. Fading a blurred surface is what did it; the card is scaled now
+  and never faded.
+- A notification banner is shown even when the computer could not register for
+  remote push — the local one was being suppressed by the failure of the remote
+  one, so a refused token meant no notification at all rather than the one that
+  still worked.
+- "Can't reach your computer" clears itself when the app comes back and the
+  connection succeeds, instead of staying on screen over a working session.
+
+### Added
+
+- **Finished turns notify you while the app is closed.** Until now a reply that
+  landed while you were in another app was silent until you opened it again.
+
+## 0.9.13 — 2026-08-08
+
+### Fixed
+
+- **`pew2 pair` can always pair again.** A pairing admits one device, so once a
+  phone had claimed it the printed code could not onboard anyone: the phone
+  holding it never needs to scan again, and everyone else is refused — including
+  that same phone after reinstalling the app, which clears its identity. The
+  command now mints a fresh code in that situation rather than printing one
+  nothing can use, and names the phone it just unpaired.
+
+  A code nobody has claimed is still printed unchanged, so running the command
+  twice while walking to your phone does not invalidate the QR you are halfway
+  through scanning. `--rotate` remains for the case this cannot see: a code that
+  leaked before it was ever used looks untouched, and still has to be replaced.
+
+  This closes a loop. The app's own refusal tells you to run `pew2 pair` on the
+  machine, which until now handed back the same code that had just been refused.
+
+## 0.9.12 — 2026-08-08
+
+### Security
+
+- **A pairing link now admits one device.** The link never expires, which is what
+  lets a phone reconnect after a reboot without scanning anything — but it also
+  meant a code caught on camera stayed usable forever. The first device to
+  complete a handshake claims the pairing; every later one is refused. Your phone
+  keeps reconnecting as before, and a QR that appears in a screenshot or a video
+  is worthless once it has.
+
+  Rotation is still the only revocation, and it is still all-or-nothing: run
+  `pew2 pair --rotate` to move a pairing to a different phone. A link that leaked
+  *before* it was ever used must be rotated, not merely re-scanned — whoever
+  claims it first, wins.
+
+- **Every phone used to call itself `phone`.** `pew2 pair` prints a link
+  containing `deviceId=phone` so the URL is valid on its own, and the app kept
+  that name instead of using its own. Devices were indistinguishable, which would
+  have made the claim above decorative. The app now always substitutes its own
+  identifier, drawn from the system's secure random source rather than
+  `Math.random`.
+
+- **A refusal is addressed to the device it refuses.** The relay forwards
+  cleartext to every app in a room, so an unaddressed refusal reached the phone
+  that owned the pairing too — and it treats one as final. Left alone, that handed
+  anyone holding a leaked link a single frame that would knock the real device
+  offline.
+
+### Fixed
+
+- **A dead pairing code says so instead of hanging.** Scanning a rotated or
+  retired code checked only that the link was well-formed, then moved on to the
+  main screen and sat on "Connecting to your machine..." indefinitely — the one
+  state that looks like a slow network and is actually permanent. Both refusals
+  happen below the socket and send nothing back, so the app now completes a real
+  handshake before it accepts a code, and stays put with the reason if it fails.
+- **A machine that cannot be reached stops claiming it is nearly there.** After
+  about fifteen seconds the app says so plainly and names what to check, while
+  continuing to retry in the background — a sleeping laptop and a retired token
+  are indistinguishable from the phone, and one of them comes back on its own.
+- **`pew2 pair` warns before you scan** when a pairing already belongs to a
+  device, rather than leaving you to discover it as a refusal on the phone.
+
+### Upgrading
+
+Nothing to do. A phone paired before this release keeps working, and claims the
+pairing properly the first time it connects from an updated app.
+
+## 0.9.11 — 2026-08-07
 
 ### Security
 
@@ -66,9 +169,19 @@ Dates are the day the tag was cut.
 - The app caps a conversation's turns in memory, matching the daemon's transcript
   cache. It was the only unbounded store in the system, on the device with the
   least memory in it.
+- Sheets open the moment you tap, instead of a beat later. Every one of them
+  waited to be measured before it would move, which cost three passes over the
+  whole screen before the first frame; the new chat sheet also stuttered on its
+  way to the project list, because resizing the card was making the screen
+  redraw on every frame of its own animation. The menu is the same story: it was
+  dragged from the same place the conversation arrives, so it stalled while an
+  agent was replying, which is exactly when you reach for it.
 
 ### Added
 
+- Sheets and the menu can be thrown. Drag a sheet down by its top edge to send
+  it away, or the menu across from either side; let go part way and it goes back
+  where it came from, at the speed you let go at.
 - Crash reporting, on-device only: a fatal error outside a render — the kind that
   ends the process with no error boundary to catch it — is recorded on the way
   down and shown on the next launch, with nothing sent anywhere.

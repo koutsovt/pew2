@@ -9,9 +9,8 @@
  * being covered, so the two surfaces read as one moving layout instead of a
  * modal layer. The panel itself is therefore static — App owns the motion.
  */
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Alert,
   Animated,
   Dimensions,
   Easing,
@@ -21,30 +20,32 @@ import {
   StyleSheet,
   Text,
   View,
+  useWindowDimensions,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { Ionicons } from "@expo/vector-icons";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import { theme } from "../theme";
-import { Orb } from "./Orb";
+import { AgentChip } from "./AgentChip";
 import { touchSlop } from "./controls";
 import { Glass } from "./Glass";
 import { haptics } from "./haptics";
 import { HistorySkeleton } from "./Skeleton";
 import { orderProvidersByRecency } from "../providerRecency";
-import { formatHistoryMetadata } from "../historyMetadata";
+import { formatHistoryMetadata, type DrawerRow } from "../historyMetadata";
 import { recentSessionsForProvider } from "../sessionHistory";
 import { useReducedMotion } from "./useReducedMotion";
+import { useAppActive } from "./useAppActive";
 import { ProjectSelect } from "./ProjectSelect";
 import { ProjectMenu } from "./ProjectMenu";
 import { sessionsInProject, type Project } from "../projects";
-import type { Provider, Session, Status } from "../useDaemon";
+import type { Provider, Status } from "../useDaemon";
 
 export const DRAWER_WIDTH = Math.min(Dimensions.get("window").width * 0.88, 380);
 
 interface SidebarProps {
   open: boolean;
   providers: Provider[];
-  sessions: Session[];
+  sessions: DrawerRow[];
   activeProviderId?: string;
   activeSessionId?: string;
   onSelectProvider: (id: string) => void;
@@ -68,7 +69,14 @@ interface SidebarProps {
   /** True when reached via a relay, so it works away from home. */
   machineRemote: boolean;
   connectionStatus: Status;
-  onUnpair: () => void;
+  onOpenConnection: () => void;
+  /**
+   * A newer pew2 the paired computer has not got, when there is one.
+   *
+   * Absent for the ordinary case, including a machine that updates itself — by
+   * the time anyone could read a notice about it, it has already happened.
+   */
+  update?: { latest: string; automatic: boolean };
   /**
    * Agents are still answering what conversations they hold. Without this the
    * drawer claims "No conversations yet" for the first seconds after connect —
@@ -79,18 +87,10 @@ interface SidebarProps {
   reduceMotion?: boolean;
 }
 
+
 const MAX_STAGGERED_ROWS = 14;
 const ROW_STAGGER_MS = 18;
 const ROW_REVEAL_MS = 180;
-
-function selectedProviderTint(color: string = theme.color.orb) {
-  return {
-    // Carry the agent's identity beyond the small orb while keeping white text
-    // comfortably legible on every manifest colour.
-    backgroundColor: `${color}3d`,
-    borderColor: `${color}8c`,
-  };
-}
 
 /**
  * The dot beside a conversation title: working, or finished while you were
@@ -105,16 +105,22 @@ function SessionStatus({
   busy,
   unread,
   reduceMotion,
+  paused,
 }: {
   busy: boolean;
   unread: boolean;
   reduceMotion: boolean;
+  /**
+   * The drawer is shut, or the app is not on screen. Rows stay mounted through
+   * both, so without this they keep pulsing where nobody can see them.
+   */
+  paused: boolean;
 }) {
   const pulse = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
     pulse.stopAnimation();
-    if (!busy || reduceMotion) {
+    if (!busy || reduceMotion || paused) {
       pulse.setValue(1);
       return;
     }
@@ -138,7 +144,7 @@ function SessionStatus({
     );
     loop.start();
     return () => loop.stop();
-  }, [busy, pulse, reduceMotion]);
+  }, [busy, pulse, reduceMotion, paused]);
 
   // Working outranks unread: a session that answered and was prompted again
   // from the desktop is, right now, working.
@@ -160,17 +166,50 @@ function SessionStatus({
 }
 
 interface SessionRowProps {
-  session: Session;
+  session: DrawerRow;
   index: number;
   active: boolean;
   reduceMotion: boolean;
-  onOpen: () => void;
+  /** Nothing in this row should be animating: shut drawer, or app in the
+   *  background. */
+  paused: boolean;
+  /** Takes the id, so one stable callback serves every row. */
+  onOpen: (id: string) => void;
 }
 
-function SessionRow({ session, index, active, reduceMotion, onOpen }: SessionRowProps) {
+const SessionRow = memo(function SessionRow({
+  session,
+  index,
+  active,
+  reduceMotion,
+  paused,
+  onOpen,
+}: SessionRowProps) {
   // Only the initial viewport cascades. Rows virtualized in later should appear
   // immediately, rather than fading under the user's finger while they scroll.
-  const shouldAnimate = !reduceMotion && index < MAX_STAGGERED_ROWS;
+  //
+  // And only rows that mount while the drawer is actually open. The list is
+  // remounted by its `key` whenever the app or the project changes, and both of
+  // those resolve on their own schedule — the daemon naming a provider a moment
+  // after launch remounts it behind a shut drawer. The cascade then ran against
+  // nothing, and pulling the drawer out a beat later caught it mid-flight: rows
+  // arriving one after another under a panel that was itself still moving. That
+  // is the drawer's intermittent stagger, and why it came and went with how
+  // quickly the daemon answered.
+  //
+  // Captured at mount rather than read each render, because this must not
+  // become true *later*: recomputing it when the drawer opens would re-run the
+  // effect below and replay the cascade on open, every open — which is the
+  // thing being fixed, arrived at from the other side.
+  //
+  // A lazy initial state rather than a ref, because this is read *during*
+  // render. The `useRef(new Animated.Value(…))` idiom used elsewhere in this
+  // file is a stable box whose identity never changes, so reading it in render
+  // is harmless; this one derives from a prop, which is the case the rule is
+  // actually about. Lazy state is the sanctioned way to freeze one at mount,
+  // and it stays correct under the React Compiler's memoisation.
+  const [revealing] = useState(() => !paused);
+  const shouldAnimate = !reduceMotion && revealing && index < MAX_STAGGERED_ROWS;
   const entrance = useRef(new Animated.Value(shouldAnimate ? 0 : 1)).current;
 
   useEffect(() => {
@@ -191,7 +230,13 @@ function SessionRow({ session, index, active, reduceMotion, onOpen }: SessionRow
     return () => animation.stop();
   }, [entrance, index, shouldAnimate]);
 
-  const metadata = formatHistoryMetadata(session);
+  // Memoised against the row's own re-renders, not just the list's. `paused`
+  // flips the instant the drawer opens, so `memo` above cannot spare these rows
+  // that particular render — the one render that lands on the frame the slide
+  // starts. Only the dot at the end of the row actually reads `paused`; this is
+  // date arithmetic for a line that has not changed, and it ran once per
+  // mounted row before the drawer had moved a pixel.
+  const metadata = useMemo(() => formatHistoryMetadata(session), [session]);
   return (
     <Animated.View
       style={{
@@ -210,7 +255,7 @@ function SessionRow({ session, index, active, reduceMotion, onOpen }: SessionRow
         accessibilityRole="button"
         accessibilityLabel={session.title}
         accessibilityState={{ selected: active }}
-        onPress={onOpen}
+        onPress={() => onOpen(session.id)}
         style={({ pressed }) => [
           styles.session,
           active && styles.sessionActive,
@@ -228,6 +273,7 @@ function SessionRow({ session, index, active, reduceMotion, onOpen }: SessionRow
             busy={session.busy === true}
             unread={session.unread === true}
             reduceMotion={reduceMotion}
+            paused={paused}
           />
         </View>
         {metadata ? (
@@ -238,7 +284,7 @@ function SessionRow({ session, index, active, reduceMotion, onOpen }: SessionRow
       </Pressable>
     </Animated.View>
   );
-}
+});
 
 function SidebarView({
   open,
@@ -255,11 +301,19 @@ function SidebarView({
   machineLabel,
   machineRemote,
   connectionStatus,
-  onUnpair,
+  onOpenConnection,
+  update,
   historyLoading = false,
   reduceMotion = false,
 }: SidebarProps) {
   const insets = useSafeAreaInsets();
+  const { fontScale } = useWindowDimensions();
+  const chipHeight = Math.max(theme.size.touch, (theme.font.small + 4) * fontScale + theme.space(2));
+  const appActive = useAppActive();
+  // Nothing in a row should be animating when the drawer is shut behind the
+  // conversation, or when the app is not on screen at all. Resolved once here
+  // rather than per row, so the whole list shares one subscription.
+  const rowsStill = !open || !appActive;
   const [menuOpen, setMenuOpen] = useState(false);
   // Measured rather than computed: the chip row above scrolls horizontally and
   // the select row's own height comes from the type inside it, so the only
@@ -277,20 +331,48 @@ function SidebarView({
     setMenuOpen(false);
   }, [open, activeProviderId]);
 
+  // The four derived lists below are memoised on what they actually read, not
+  // because any one of them is slow on its own, but because of *when* they run.
+  //
+  // Opening the drawer flips `open`, and that render lands on the same frame
+  // the slide starts. The translation itself is on the UI thread and does not
+  // care, but a sort, two filters and a scan of every session held the JS
+  // thread through the first frames of it — exactly when the list below is also
+  // laying out its rows. That is the hitch the drawer had on the way out, and
+  // the reason it was intermittent: it cost nothing until enough conversations
+  // had accumulated to be worth sorting.
+  //
+  // Now `open` changing re-renders a component whose data is all cache hits.
+
   // Most recently used app first, so the daily driver is never off-screen
   // behind apps that were tried once.
-  const orderedProviders = orderProvidersByRecency(providers, sessions);
-  // Ready to use right now. `providers` also carries the ones that are known but
-  // unusable — not installed, or missing an API key — and they are shown greyed
-  // out rather than hidden, so the total would overstate what works.
-  const availableCount = providers.filter((provider) => provider.available).length;
+  const orderedProviders = useMemo(
+    () => orderProvidersByRecency(providers, sessions),
+    [providers, sessions],
+  );
 
-  const selectedProject = projects.find((project) => project.path === selectedProjectPath);
+  const selectedProject = useMemo(
+    () => projects.find((project) => project.path === selectedProjectPath),
+    [projects, selectedProjectPath],
+  );
   // Narrowed before the recent-work cap, or a project's older conversations
   // would be cut away by a window they were never in.
-  const visible = recentSessionsForProvider(
-    sessionsInProject(sessions, selectedProject),
-    activeProviderId,
+  const visible = useMemo(
+    () => recentSessionsForProvider(sessionsInProject(sessions, selectedProject), activeProviderId),
+    [sessions, selectedProject, activeProviderId],
+  );
+
+  // Stable, so the memoised rows below actually bail out. Built per render it
+  // was a new function for every row on every render, which defeats the memo
+  // entirely: opening the drawer re-rendered the whole first batch — eighteen
+  // rows, per `initialNumToRender` below — and re-ran each one's date
+  // formatting, on the frame the slide begins.
+  const openRow = useCallback(
+    (id: string) => {
+      haptics.tap();
+      onOpenSession(id);
+    },
+    [onOpenSession],
   );
   // Spoken only. The dot beside the title carries this at a glance; a screen
   // reader gets the sentence, including which computer it is about.
@@ -322,17 +404,7 @@ function SidebarView({
                 connection state is the first thing to check when the drawer is
                 opened, and it belongs to the list of apps it describes. */}
             <View style={styles.headerTitleRow}>
-              <Text style={styles.headerTitle}>Connected Apps</Text>
-              {/* The count is of apps that can actually be tapped, not of
-                  manifests: the list also holds agents that are installed but
-                  missing a key, or not installed at all, and counting those
-                  would promise more than the drawer delivers. Hidden entirely at
-                  zero — a lone "0" beside the title reads as an error state
-                  rather than as "still looking".
-
-                  Placed after the dot, not between it and the title: the dot is
-                  the title's own status and the two belong together, so pushing
-                  them a full gap apart would break that pairing. */}
+              <Text style={styles.headerTitle}>Agents</Text>
               <View
                 style={[styles.connectionDot, { backgroundColor: connectionColor }]}
                 accessibilityRole="text"
@@ -340,17 +412,6 @@ function SidebarView({
                   machineRemote ? "Reachable from anywhere." : "Same network only."
                 }`}
               />
-              {availableCount > 0 && (
-                <View
-                  style={styles.headerCount}
-                  accessibilityRole="text"
-                  // Without this it is announced as a bare number after the
-                  // title, which says nothing about what was counted.
-                  accessibilityLabel={`${availableCount} ${availableCount === 1 ? "app" : "apps"} ready to use`}
-                >
-                  <Text style={styles.headerCountText}>{availableCount}</Text>
-                </View>
-              )}
             </View>
             {/* No button here. A "new chat" in the drawer header sits above the
                 app chips and the project selector both, so it could only mean
@@ -364,44 +425,16 @@ function SidebarView({
             showsHorizontalScrollIndicator={false}
             // Without an explicit height a horizontal ScrollView stretches to
             // fill the remaining column space and pushes the history far down.
-            style={styles.agentScroller}
+            style={[styles.agentScroller, { height: chipHeight }]}
             contentContainerStyle={styles.agentRow}
           >
             {orderedProviders.map((provider) => (
-              <Glass
+              <AgentChip
                 key={provider.id}
-                radius={theme.radius.pill}
-                interactive={provider.available}
-                style={!provider.available && styles.chipDisabled}
-              >
-                <Pressable
-                  disabled={!provider.available}
-                  accessibilityRole="button"
-                  accessibilityLabel={
-                    provider.available
-                      ? provider.name
-                      : `${provider.name}, unavailable. ${provider.unavailableReason ?? ""}`
-                  }
-                  accessibilityState={{
-                    selected: provider.id === activeProviderId,
-                    disabled: !provider.available,
-                  }}
-                  onPress={() => {
-                    haptics.select();
-                    onSelectProvider(provider.id);
-                  }}
-                  style={({ pressed }) => [
-                    styles.agentChip,
-                    provider.id === activeProviderId && selectedProviderTint(provider.color),
-                    pressed && provider.available && styles.pressed,
-                  ]}
-                >
-                  <Orb color={provider.color} size={18} />
-                  <Text style={styles.agentChipText} numberOfLines={1}>
-                    {provider.name}
-                  </Text>
-                </Pressable>
-              </Glass>
+                provider={provider}
+                selected={provider.id === activeProviderId}
+                onPress={onSelectProvider}
+              />
             ))}
           </ScrollView>
 
@@ -471,45 +504,21 @@ function SidebarView({
                 index={index}
                 active={session.id === activeSessionId}
                 reduceMotion={reduceMotion}
-                onOpen={() => {
-                  haptics.tap();
-                  onOpenSession(session.id);
-                }}
+                paused={rowsStill}
+                onOpen={openRow}
               />
             )}
           />
 
-          {/* Connection state is the dot beside the title now, so this row is
-              just the one action it always carried. The host name stays out of
-              sight and in the spoken label. */}
-          <View style={styles.machine}>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={`Forget pairing with ${machineLabel}`}
-              hitSlop={touchSlop(theme.size.touch)}
-              onPress={() => {
-                haptics.tap();
-                Alert.alert(
-                  "Forget this computer?",
-                  "You'll need to scan or paste its pairing link to connect again.",
-                  [
-                    { text: "Cancel", style: "cancel" },
-                    {
-                      text: "Forget",
-                      style: "destructive",
-                      onPress: () => {
-                        haptics.warned();
-                        onUnpair();
-                      },
-                    },
-                  ],
-                );
-              }}
-              style={({ pressed }) => pressed && styles.pressed}
-            >
-              <Text style={styles.machineAction}>Forget</Text>
-            </Pressable>
-          </View>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`Connection details for ${machineLabel}${update ? update.automatic ? ", updating pew2" : ", update available" : ""}`}
+            onPress={() => { haptics.tap(); onOpenConnection(); }}
+            style={({ pressed }) => [styles.machine, { marginBottom: insets.bottom }, pressed && styles.pressed]}
+          >
+            <Ionicons name="options-outline" size={18} color={theme.color.textDim} />
+            <Text style={styles.machineAction}>{update ? update.automatic ? "Connection · Updating…" : "Connection · Update available" : "Connection"}</Text>
+          </Pressable>
 
           {/* Last child, so it paints over the history it drops across. Inside
               the panel rather than over the whole screen: it is the drawer's
@@ -594,18 +603,12 @@ function NewChatChip({ project, onPress }: { project: Project; onPress: () => vo
 
 const styles = StyleSheet.create({
   machine: {
-    flexDirection: "row",
-    alignItems: "center",
-    // Right-aligned: Forget keeps the edge it has always sat on, now that the
-    // status text that used to fill this row is gone.
-    justifyContent: "flex-end",
-    marginHorizontal: theme.gutter,
-    marginTop: theme.space(2),
-    paddingTop: theme.space(3),
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: theme.color.border,
+    flexDirection: "row", alignItems: "center", gap: theme.space(2),
+    minHeight: theme.size.touch, marginHorizontal: theme.gutter,
+    marginTop: theme.sectionGap, paddingVertical: theme.space(3),
+    borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.color.border,
   },
-  machineAction: { color: theme.color.danger, fontSize: 12, fontWeight: "600" },
+  machineAction: { color: theme.color.textDim, fontSize: theme.font.small, lineHeight: 17, flexShrink: 1 },
 
   // The drawer is the lower layer: it stays put while the conversation slides
   // right to reveal it, so it needs no transform of its own.
@@ -637,29 +640,13 @@ const styles = StyleSheet.create({
     // the title and the hamburger beside it share one baseline.
     paddingHorizontal: theme.gutter,
     height: theme.size.control,
-    marginBottom: theme.space(3),
+    // One step, shared by every gap down this column.
+    marginBottom: theme.sectionGap,
   },
   headerTitleRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: theme.space(2),
-  },
-  // Sized from its own text rather than given a fixed width, so a two-digit
-  // count cannot clip. `minWidth` keeps a single digit from looking pinched.
-  headerCount: {
-    minWidth: 22,
-    paddingHorizontal: theme.space(1.5),
-    paddingVertical: 2,
-    borderRadius: theme.radius.pill,
-    backgroundColor: theme.color.surfaceRaised,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  headerCountText: {
-    color: theme.color.textDim,
-    fontFamily: theme.display.semibold,
-    fontSize: theme.font.tiny,
-    textAlign: "center",
   },
   // Colour is the whole message, so it needs no glyph and no label beside it.
   connectionDot: { width: 8, height: 8, borderRadius: 4 },
@@ -670,27 +657,12 @@ const styles = StyleSheet.create({
     letterSpacing: 0.4,
   },
 
-  agentScroller: { flexGrow: 0, height: theme.size.chip },
+  agentScroller: { flexGrow: 0 },
   agentRow: {
     paddingHorizontal: theme.gutter,
     gap: theme.space(2),
     alignItems: "center",
   },
-  agentChip: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: theme.space(2),
-    height: theme.size.chip,
-    paddingHorizontal: theme.space(3.5),
-    borderRadius: theme.radius.pill,
-  },
-  agentChipText: {
-    color: theme.color.text,
-    fontSize: theme.font.small,
-    lineHeight: theme.font.small + 4,
-    maxWidth: 140,
-  },
-  chipDisabled: { opacity: 0.4 },
   pressed: { opacity: 0.6 },
 
   // A heading, not a caption: the drawer has two sections and they are peers,
@@ -710,12 +682,12 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     gap: theme.space(2),
     paddingHorizontal: theme.gutter,
-    paddingTop: theme.space(5),
+    paddingTop: theme.sectionGap,
     paddingBottom: theme.space(2),
     // Always the chip's height, whether or not the chip is there. Otherwise
     // choosing a project grows this row and shoves the whole list down a
     // centimetre — the button's own spring lands on top of a jump.
-    minHeight: theme.size.control + theme.space(7),
+    minHeight: theme.size.chip + theme.sectionGap + theme.space(2),
   },
   newChip: {
     flexDirection: "row",

@@ -18,6 +18,7 @@ import { workspaceStatus } from "./git.js";
 import { resolveWorkspace } from "./workspace.js";
 import { discoverRepos, listDirectory } from "./workspaces.js";
 import { wire } from "@pew2/protocol";
+import { pushFinishedTurn } from "./push.js";
 
 export interface HandlerContext {
   daemon: Daemon;
@@ -27,6 +28,15 @@ export interface HandlerContext {
   broadcast: (message: unknown) => void;
   /** Default working directory when a client does not name one. */
   cwd?: string;
+  /**
+   * Which paired device sent this frame, as proved during its `hello`.
+   *
+   * Only set once that handshake has completed, so a message arriving before it
+   * cannot claim to be from anyone. Used to key the push registry: it is the one
+   * identifier that survives the socket the token arrived on, which by the time
+   * a push is needed has usually closed.
+   */
+  deviceId?: string;
 }
 
 /**
@@ -44,8 +54,8 @@ export interface HandlerContext {
  * refusal deliberately says nothing about whether the path exists — answering
  * that for an arbitrary string is a filesystem oracle in its own right.
  */
-function namedProject(daemon: Daemon, providerId: string, cwd: string): string {
-  const known = daemon.knownProject(providerId, cwd);
+async function namedProject(daemon: Daemon, providerId: string, cwd: string): Promise<string> {
+  const known = await daemon.knownProject(providerId, cwd);
   if (!known) throw new Error("unknown project");
   return known;
 }
@@ -131,7 +141,10 @@ export async function handleMessage(raw: string, ctx: HandlerContext): Promise<v
         // for? Both come from the agent itself, so the reply reflects the
         // installed version rather than anything baked into pew2.
         const providerId = message.providerId;
-        const capabilities = await daemon.probeProvider(providerId, {
+        // `capabilitiesFor`, not `probeProvider`: the probe is the agent's own
+        // answer, and what the app has to render is the state a new session will
+        // actually open in — the agent's list at this user's remembered values.
+        const capabilities = await daemon.capabilitiesFor(providerId, {
           refresh: message.refresh === true,
         });
         reply({ t: "provider.capabilities", providerId, ...capabilities });
@@ -143,7 +156,7 @@ export async function handleMessage(raw: string, ctx: HandlerContext): Promise<v
         // broadcast: it is a menu choice on one phone, not a change to the
         // session log every client shares.
         const providerId = message.providerId;
-        const projectCwd = namedProject(daemon, providerId, message.cwd);
+        const projectCwd = await namedProject(daemon, providerId, message.cwd);
         const sessions = await daemon.sessionsForProject(providerId, projectCwd);
         reply({
           t: "provider.sessions",
@@ -170,11 +183,27 @@ export async function handleMessage(raw: string, ctx: HandlerContext): Promise<v
         // break reopening a session every time the daemon was updated. The
         // containment is unchanged either way: the client's string is used only
         // when this daemon published it, and otherwise never reaches a spawn.
-        const named = message.cwd
-          ? daemon.knownProject(message.providerId, message.cwd)
-          : undefined;
-        const workspace =
-          named ?? (await daemon.lastWorkspace(message.providerId)) ?? cwd;
+        //
+        // What the fallback must not do is *guess a different project*, which is
+        // what it used to: dropping to the provider's last workspace reopened a
+        // conversation about one repo with the agent rooted in another, and told
+        // every client to file it there. So the agent's own record for this
+        // conversation comes first — it is the authority on where its own
+        // session lives, it needs no client to be up to date, and it is right
+        // even for an older app that sends no `cwd` at all.
+        const recorded = await daemon.agentSessionCwd(
+          message.providerId,
+          message.agentSessionId,
+        );
+        // Only asked when the agent had no record: checking a path also files it
+        // as a project this client has opened, and the one it sent here is not
+        // the one being opened.
+        const named =
+          recorded ??
+          (message.cwd
+            ? await daemon.knownProject(message.providerId, message.cwd)
+            : undefined);
+        const workspace = named ?? (await daemon.lastWorkspace(message.providerId)) ?? cwd;
         const pending = daemon.beginResumeSession(
           message.providerId,
           message.agentSessionId,
@@ -186,6 +215,11 @@ export async function handleMessage(raw: string, ctx: HandlerContext): Promise<v
           providerId: message.providerId,
           configOptions: [],
           resumed: true,
+          // Where this conversation lives, resolved here because only this
+          // machine can resolve it. Clients file sessions by project and hide
+          // the ones they cannot place, so a session announced without it is
+          // one the drawer will not show under a selected project.
+          cwd: workspace,
           // Clients list the agent's copy as a stub; this is what lets them
           // replace it with the live session instead of showing it twice.
           agentSessionId: message.agentSessionId,
@@ -217,13 +251,19 @@ export async function handleMessage(raw: string, ctx: HandlerContext): Promise<v
         // has no file picker, and defaulting to the home directory gives the
         // agent no project to work in and no project commands to offer.
         const workspace = message.cwd
-          ? namedProject(daemon, message.providerId, message.cwd)
+          ? await namedProject(daemon, message.providerId, message.cwd)
           : ((await daemon.lastWorkspace(message.providerId)) ?? cwd);
         const sessionId = await daemon.startSession(message.providerId, workspace);
         broadcast({
           t: "session.started",
           sessionId,
           providerId: message.providerId,
+          // The project the session was actually started in, which is not
+          // always the one asked for: a request naming no project opens in the
+          // agent's last workspace above. Sending the resolved value means a
+          // client files the row where the work is really happening, and a
+          // second device — which never saw the request — can file it at all.
+          cwd: workspace,
           // Echoed so a client can tell its own session from one another device
           // started. Without it, every client adopts every new session.
           requestId: message.requestId,
@@ -260,13 +300,52 @@ export async function handleMessage(raw: string, ctx: HandlerContext): Promise<v
           // Carries the project and agent so a client can announce a session it
           // is not showing — the phone is usually elsewhere by the time a long
           // turn ends, and only this machine knows the path.
-          .finally(() =>
+          .finally(() => {
             broadcast({
               t: "session.idle",
               sessionId,
               ...daemon.sessionOrigin(sessionId),
-            }),
-          );
+            });
+            // And again, out of band, to phones whose sockets are asleep.
+            //
+            // Sent unconditionally rather than only when no app is attached.
+            // Knowing that would mean trusting the relay's account of who is
+            // connected, and the relay is the one party in this system that is
+            // assumed hostile. It is also unreliable: a backgrounded iOS app
+            // holds a socket that looks alive for a while after its JavaScript
+            // has stopped, so "attached" does not mean "will show a banner".
+            //
+            // Duplicates are handled where the information actually exists —
+            // on the device, which knows whether it is foreground and which
+            // conversation is on screen. That is the same rule the local
+            // banner already applies, so there is one decision, not two.
+            //
+            // Not awaited: a turn is over, and the push service must never be
+            // able to hold a session open or fail it.
+            void pushFinishedTurn(daemon.pushTargets, {
+              sessionId,
+              ...daemon.sessionNotice(sessionId),
+            });
+          });
+        break;
+      }
+
+      case "app.push": {
+        // `deviceId` comes from the `hello` on this connection, so a phone that
+        // reconnects with a rotated token replaces its own entry rather than
+        // adding a second one — otherwise every app restart would cost another
+        // copy of every banner.
+        const deviceId = ctx.deviceId;
+        if (!deviceId) {
+          reply(errorMessage("push_unidentified", "Say hello before registering for push."));
+          break;
+        }
+        if (!daemon.pushTargets.register(deviceId, message.token, message.platform)) {
+          // Said out loud rather than ignored: a silently rejected token looks
+          // exactly like a working one until someone waits for a notification
+          // that never comes.
+          reply(errorMessage("push_token_invalid", "That is not an Expo push token."));
+        }
         break;
       }
 
@@ -339,7 +418,7 @@ export async function handleMessage(raw: string, ctx: HandlerContext): Promise<v
         // directory the answer already listed.
         const chosen =
           message.providerId && message.cwd
-            ? daemon.knownProject(message.providerId, message.cwd)
+            ? await daemon.knownProject(message.providerId, message.cwd)
             : undefined;
         const root =
           (message.sessionId ? daemon.sessionCwd(message.sessionId) : undefined) ??

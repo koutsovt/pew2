@@ -18,7 +18,7 @@ import {
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { Ionicons } from "@expo/vector-icons";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import { theme } from "../theme";
 import { haptics } from "./haptics";
 import { parsePairing, type Pairing } from "../pairingLink";
@@ -26,6 +26,8 @@ import { deviceId } from "../pairing";
 import { QrScanner } from "./QrScanner";
 import { CircleButton } from "./controls";
 import { Glass } from "./Glass";
+import { PrivacyLink } from "./PrivacyLink";
+import { verifyPairing } from "../verifyPairing";
 
 interface Props {
   onPaired: (pairing: Pairing) => void;
@@ -56,6 +58,16 @@ export function PairingScreen({ onPaired, onBack, notice }: Props) {
       // as a socket that silently never connects.
       return result.error;
     }
+
+    // Shape is not proof. A retired token parses exactly like a live one, and
+    // storing it here used to send the user to the main screen to watch
+    // "Connecting to your machine..." forever — a permanent failure wearing the
+    // costume of a slow network. Both refusals happen below the WebSocket (401
+    // from the daemon, 409 from the relay for a room with no machine in it), so
+    // the only way to know is to complete a handshake.
+    const verified = await verifyPairing(result.pairing);
+    if (!verified.ok) return verified.message;
+
     onPaired(result.pairing);
     return null;
   };
@@ -73,7 +85,11 @@ export function PairingScreen({ onPaired, onBack, notice }: Props) {
   };
 
   const handleScan = async (value: string) => {
+    // Checking the code is a round trip, and the scanner latches after a read,
+    // so without this the camera sits frozen for seconds with nothing said.
+    setBusy(true);
     const failure = await accept(value);
+    setBusy(false);
     if (!failure) {
       setScanning(false);
       return;
@@ -203,9 +219,15 @@ export function PairingScreen({ onPaired, onBack, notice }: Props) {
 
       <Text style={styles.footnote}>This is your password link. Keep safe.</Text>
 
+      {/* On this screen and not only in the drawer: the drawer is behind a
+          pairing, and anyone who cannot pair — a reviewer without a daemon
+          running — would otherwise never reach the policy at all. */}
+      <PrivacyLink style={styles.privacy} />
+
       <QrScanner
         visible={scanning}
         error={scanError}
+        busy={busy}
         onScan={(value) => void handleScan(value)}
         onClose={() => {
           setScanning(false);
@@ -321,4 +343,5 @@ const styles = StyleSheet.create({
     lineHeight: 19,
     marginTop: theme.space(8),
   },
+  privacy: { marginTop: theme.space(4), alignSelf: "flex-start" },
 });

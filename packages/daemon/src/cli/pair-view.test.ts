@@ -101,6 +101,32 @@ test("rotation warns that existing devices are now unpaired", () => {
   expect(text).toContain("just rotated");
 });
 
+test("a code that replaced another phone names the one it unpaired", () => {
+  // `pew2 pair` re-mints a pairing that a phone already holds, because the old
+  // code could not have onboarded anyone. The previous phone stops working the
+  // moment this screen appears, so saying which one keeps that reading as a
+  // consequence of what the user just did rather than the tool losing state.
+  const text = renderPair(
+    view({ rotated: true, supersededDevice: "Kens-iPhone" }),
+    undefined,
+    plain,
+  )
+    .map(stripAnsi)
+    .join("\n");
+
+  expect(text).toContain("Kens-iPhone is unpaired and must scan again");
+});
+
+test("a rotation with nothing to supersede stays general", () => {
+  // `--rotate` on a pairing no device ever claimed has no name to give, and
+  // inventing one would be worse than the general warning.
+  const text = renderPair(view({ rotated: true }), undefined, plain)
+    .map(stripAnsi)
+    .join("\n");
+
+  expect(text).toContain("devices paired before now must scan again");
+});
+
 test("the QR is centred without touching its own escape sequences", () => {
   // The QR sets a background per cell; indenting inside the escapes would bleed
   // the terminal's own background into the quiet zone and can stop it scanning.

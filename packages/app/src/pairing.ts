@@ -6,6 +6,7 @@
  * Validation lives in `pairingLink.ts`, which stays pure so it can be tested.
  */
 import * as SecureStore from "expo-secure-store";
+import { getRandomValues } from "expo-crypto";
 import { parsePairing, type Pairing } from "./pairingLink";
 
 export { parsePairing, type Pairing, type ParseResult } from "./pairingLink";
@@ -19,18 +20,28 @@ const DEVICE_KEY = "pew2.deviceId";
  * The relay uses it to tell devices apart, and it must survive restarts: a new
  * id on every launch would make one phone look like an endless stream of
  * different devices.
+ *
+ * Also what the daemon binds a pairing to. A pairing link admits one device,
+ * and this id is how the daemon recognises it on every later connection — so it
+ * is drawn from the system CSPRNG rather than `Math.random`, whose output is
+ * predictable from a handful of samples. Someone holding a leaked link is
+ * refused only for as long as they cannot guess the id that claimed it.
  */
 export async function deviceId(): Promise<string> {
   try {
     const existing = await SecureStore.getItemAsync(DEVICE_KEY);
     if (existing) return existing;
-    const minted = `phone-${Math.random().toString(36).slice(2, 10)}`;
+    const bytes = getRandomValues(new Uint8Array(16));
+    const minted = `phone-${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
     await SecureStore.setItemAsync(DEVICE_KEY, minted);
     return minted;
   } catch {
-    // Without storage the id cannot persist; a constant is still better than a
-    // connection the relay refuses.
-    return "phone";
+    // Without storage the id cannot persist, and a fixed fallback would be a
+    // shared identity every install could claim under. Random keeps the pairing
+    // gate meaningful; the cost is re-pairing after a restart, which is the
+    // safer of the two failures.
+    const bytes = getRandomValues(new Uint8Array(16));
+    return `phone-${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
   }
 }
 
@@ -43,12 +54,18 @@ export async function deviceId(): Promise<string> {
  */
 export async function loadPairing(): Promise<Pairing | null> {
   try {
-    const stored = await SecureStore.getItemAsync(KEY);
+    // Both reads at once. They are independent keys, and this sits directly on
+    // the launch path: run in sequence, the app waited out two round trips to
+    // the keychain — with the splash held over both — before it could decide
+    // which screen to show. Asking for the device id even when nothing is
+    // stored costs a first-launch mint that the pairing screen would trigger
+    // moments later anyway, so the id is simply ready sooner.
+    const [stored, id] = await Promise.all([SecureStore.getItemAsync(KEY), deviceId()]);
     if (!stored) return null;
     // Stored with its fragment intact, because `parsePairing` strips the key out
     // of the URL it returns — keeping only that would lose the key on the first
     // reload, and the app would greet a paired user with the pairing screen.
-    const parsed = parsePairing(stored, await deviceId());
+    const parsed = parsePairing(stored, id);
     return parsed.ok ? parsed.pairing : null;
   } catch {
     // A locked or unavailable keychain must show the pairing screen, not crash.

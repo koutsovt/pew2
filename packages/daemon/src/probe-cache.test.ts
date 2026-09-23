@@ -249,3 +249,135 @@ test("a cache without message counts is still served from disk", async () => {
     else process.env.PEW2_HOME = home;
   }
 });
+
+test("a stale cached probe is refreshed on the next ask, not once per daemon", async () => {
+  // The bug this covers: the probe was memoised for the daemon's lifetime and
+  // refreshed exactly once, on the first cache hit after boot. A daemon runs
+  // for days while the user works at the desk, so every session and project
+  // started after that single refresh was invisible to the phone until the
+  // daemon restarted — a two-day-old list against an agent used minutes ago.
+  const env = await tempEnv();
+  await writeProbeCache("echo", capabilities, env);
+
+  const home = process.env.PEW2_HOME;
+  process.env.PEW2_HOME = env.PEW2_HOME;
+  try {
+    const { Daemon } = await import("./index.js");
+    const daemon = new Daemon({ id: "test", name: "test" }, true);
+    await daemon.refreshProviders();
+
+    // First ask: served from disk, with the boot-time refresh behind it.
+    await daemon.probeProvider("echo");
+    await (daemon as any).refreshing.get("echo");
+
+    // A second ask moments later must *not* spawn again — the answer is fresh.
+    await daemon.probeProvider("echo");
+    expect((daemon as any).refreshing.has("echo")).toBe(false);
+
+    // The refresh above parked a spare, which is the second half of this bug:
+    // the disk-serve path delegated its reprobe to `warmProvider`, and that
+    // returns early whenever any warm process exists. A provider warmed by
+    // anything else therefore never refreshed again at all.
+    expect(daemon.spareDirs("echo").length).toBeGreaterThan(0);
+
+    // Age the answer past the interval, as a daemon left running overnight does.
+    (daemon as any).probedAt.set("echo", Date.now() - 10 * 60 * 1000);
+    await daemon.probeProvider("echo");
+
+    // Now it refreshes: work done at the desk since reaches the next reconnect.
+    expect((daemon as any).refreshing.has("echo")).toBe(true);
+    await (daemon as any).refreshing.get("echo");
+    daemon.closeAll();
+  } finally {
+    if (home === undefined) delete process.env.PEW2_HOME;
+    else process.env.PEW2_HOME = home;
+  }
+});
+
+test("a probe still booting is already dated, so nobody starts a second one", async () => {
+  // A pending probe is parked for other callers to wait on, and with no cache
+  // file behind it there was nothing dating it. An undated answer reads as
+  // "never probed", so the staleness check judged a boot that was still running
+  // to be stale — and the next asker to arrive during it, the drawer opening
+  // while a project is being chosen, spawned a duplicate agent beside the one
+  // it was already waiting on. Two agents at 90-370MB, for one question.
+  const env = await tempEnv();
+
+  const home = process.env.PEW2_HOME;
+  process.env.PEW2_HOME = env.PEW2_HOME;
+  try {
+    const { Daemon } = await import("./index.js");
+    const daemon = new Daemon({ id: "test", name: "test" }, true);
+    await daemon.refreshProviders();
+
+    const probe = daemon.probeProvider("echo");
+    // Resolves once the process answers, while the probe is still listing
+    // history — the window a second ask lands in.
+    await (daemon as any).awaitSpare("echo");
+
+    expect((daemon as any).probedAt.has("echo")).toBe(true);
+    // So an ask arriving now is answered from the boot in flight, not by
+    // starting another.
+    await daemon.probeProvider("echo");
+    expect((daemon as any).refreshing.has("echo")).toBe(false);
+
+    await probe;
+    daemon.closeAll();
+  } finally {
+    if (home === undefined) delete process.env.PEW2_HOME;
+    else process.env.PEW2_HOME = home;
+  }
+});
+
+test("a background refresh writes to the home its daemon was built for", async () => {
+  // A cache hit kicks off a live reprobe that outlives the call, and its write
+  // lands whenever the agent finishes answering. Resolving `PEW2_HOME` at that
+  // moment rather than at construction meant the write followed whatever home
+  // was installed *then* — so a refresh belonging to one daemon could overwrite
+  // a cache belonging to something else.
+  //
+  // In production nothing moves `PEW2_HOME` and the two are the same value. In a
+  // test process where several homes exist at once it is the difference between
+  // isolated cases and a suite that fails on whichever one happened to be
+  // reading when a stray write landed.
+  const mine = await tempEnv();
+  const theirs = await tempEnv();
+  await writeProbeCache("echo", capabilities, mine);
+  await writeProbeCache(
+    "echo",
+    { ...capabilities, sessions: [{ sessionId: "t1", cwd: "/tmp", title: "Not yours" }] },
+    theirs,
+  );
+
+  const home = process.env.PEW2_HOME;
+  process.env.PEW2_HOME = mine.PEW2_HOME;
+  try {
+    const { Daemon } = await import("./index.js");
+    const daemon = new Daemon({ id: "test", name: "test" }, true);
+    await daemon.refreshProviders();
+
+    // Serves from disk and arms the background refresh that used to leak.
+    await daemon.probeProvider("echo");
+
+    // The ambient home moves on, exactly as it does when the next test installs
+    // its own, while that refresh is still in flight.
+    process.env.PEW2_HOME = theirs.PEW2_HOME;
+    await (daemon as any).warming.get("echo");
+
+    // The cache write is fire-and-forget inside the probe, so it lands after the
+    // refresh itself resolves. Give it room to arrive rather than reading the
+    // instant before it would have — a race here would make this test pass
+    // whether or not the leak exists, which is worse than not having it.
+    for (let i = 0; i < 50; i += 1) {
+      if ((await readProbeCache("echo", theirs))?.sessions[0]?.title !== "Not yours") break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    daemon.closeAll();
+
+    // The other home is untouched: no live probe result landed on top of it.
+    expect((await readProbeCache("echo", theirs))?.sessions[0]?.title).toBe("Not yours");
+  } finally {
+    if (home === undefined) delete process.env.PEW2_HOME;
+    else process.env.PEW2_HOME = home;
+  }
+});

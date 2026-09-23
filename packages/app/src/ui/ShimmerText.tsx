@@ -18,6 +18,7 @@ import MaskedView from "@react-native-masked-view/masked-view";
 import { LinearGradient } from "expo-linear-gradient";
 import { theme } from "../theme";
 import { useReducedMotion } from "./useReducedMotion";
+import { useAppActive } from "./useAppActive";
 
 /**
  * Highlight that fades in and out of the base colour rather than replacing it.
@@ -53,6 +54,13 @@ export type ShimmerTextProps = {
   gap?: number;
   /** Long tool titles must not wrap the transcript's footer to two lines. */
   numberOfLines?: number;
+  /**
+   * Ceiling on the OS text scale, for a caller whose row is a fixed height.
+   * Both `Text` nodes carry it: they are the same glyphs measured twice, and a
+   * mask that scales differently from the layer under it lights the wrong
+   * pixels.
+   */
+  maxFontSizeMultiplier?: number;
 };
 
 function ShimmerTextView({
@@ -64,13 +72,17 @@ function ShimmerTextView({
   duration = 1800,
   gap = 0,
   numberOfLines,
+  maxFontSizeMultiplier,
 }: ShimmerTextProps) {
   const sweep = useRef(new Animated.Value(0)).current;
   const reduceMotion = useReducedMotion();
+  const appActive = useAppActive();
   const [width, setWidth] = useState(0);
 
+  // Paused while backgrounded. This runs for as long as the agent is thinking,
+  // which is exactly when someone is most likely to have switched away.
   useEffect(() => {
-    if (reduceMotion || width === 0) return;
+    if (reduceMotion || !appActive || width === 0) return;
     const pass = Animated.timing(sweep, {
       toValue: 1,
       duration,
@@ -85,7 +97,7 @@ function ShimmerTextView({
     );
     loop.start();
     return () => loop.stop();
-  }, [duration, gap, reduceMotion, sweep, width]);
+  }, [duration, gap, reduceMotion, appActive, sweep, width]);
 
   // The mask only reads alpha, so this colour matters solely where a platform
   // has no mask (web): there the text is drawn directly, and naming the resting
@@ -98,7 +110,11 @@ function ShimmerTextView({
       style={styles.host}
       // The text is the mask, so the gradient below paints only the glyphs.
       maskElement={
-        <Text style={label} numberOfLines={numberOfLines}>
+        <Text
+          style={label}
+          numberOfLines={numberOfLines}
+          maxFontSizeMultiplier={maxFontSizeMultiplier}
+        >
           {text}
         </Text>
       }
@@ -116,7 +132,11 @@ function ShimmerTextView({
           setWidth((current) => (current === next ? current : next));
         }}
       >
-        <Text style={[label, styles.invisible]} numberOfLines={numberOfLines}>
+        <Text
+          style={[label, styles.invisible]}
+          numberOfLines={numberOfLines}
+          maxFontSizeMultiplier={maxFontSizeMultiplier}
+        >
           {text}
         </Text>
       </View>
